@@ -124,7 +124,8 @@ public:
         const Tracker& tracker,
         const GameConfig& cfg,
         const World& world,
-        double scan_fallback_yaw
+        double scan_fallback_yaw,
+        bool suppress_blind_precharge = false
     ) const {
         CombatDecision out;
         out.preferred_secondary = prefer_lightning_secondary ? "lightning" : "gun";
@@ -237,7 +238,7 @@ public:
                     danger_npc->pos, danger_npc->vel,
                     cfg.npc_radius, cfg.npc_height,
                     danger_npc->hp, false, false, true, 0.50, {0, 0, 0},
-                    self, tracker, world, muzzle_offset, dmg_mult, shorted || suppress_laser, out
+                    self, tracker, world, muzzle_offset, dmg_mult, shorted || suppress_laser, false, out
                 );
                 return out;
             }
@@ -263,7 +264,7 @@ public:
                 best_mech->hp, best_mech->is_mech,
                 best_mech->has_weapon("mortar"),
                 best_mech->in_solid_los, best_mech->best_aim_z_frac, best_mech->accel,
-                self, tracker, world, muzzle_offset, dmg_mult, shorted, out
+                self, tracker, world, muzzle_offset, dmg_mult, shorted, suppress_blind_precharge, out
             );
             // Rear armor protection: if primary has NO LOS right now and we're not holding laser charge,
             // make sure we face any recent rear attacker!
@@ -315,7 +316,7 @@ public:
                         best_crate->pos, {0, 0, 0},
                         cfg.crate_radius, cfg.crate_height,
                         best_crate->hp, false, false, true, 0.50, {0, 0, 0},
-                        self, tracker, world, muzzle_offset, dmg_mult, shorted, out
+                        self, tracker, world, muzzle_offset, dmg_mult, shorted, false, out
                     );
                     return out;
                 } else if (best_npc) {
@@ -323,7 +324,7 @@ public:
                         best_npc->pos, best_npc->vel,
                         cfg.npc_radius, cfg.npc_height,
                         best_npc->hp, false, false, true, 0.50, {0, 0, 0},
-                        self, tracker, world, muzzle_offset, dmg_mult, shorted, out
+                        self, tracker, world, muzzle_offset, dmg_mult, shorted, false, out
                     );
                     return out;
                 }
@@ -455,6 +456,7 @@ private:
         double muzzle_offset,
         double dmg_mult,
         bool shorted,
+        bool suppress_blind_precharge,
         CombatDecision& out
     ) const {
         Vec3 pivot = self.muzzle_pivot();
@@ -546,7 +548,7 @@ private:
                         out.want_peek_for_laser = true;
                         laser_aim_priority = true;
                         yaw_pitch_from_vec((target_com + target_vel * 0.15) - pivot, out.aim_yaw, out.aim_pitch);
-                        if (dist < 130.0) {
+                        if (dist < 130.0 && !suppress_blind_precharge) {
                             out.fire[laser_slot] = true;
                         }
                     }

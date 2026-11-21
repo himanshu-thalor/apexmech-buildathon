@@ -60,7 +60,8 @@ public:
         tracker.update(obs, self, cfg, w);
 
         scan_yaw = wrap_angle(scan_yaw + 0.28);
-        CombatDecision cd = combat.decide(obs, self, tracker, cfg, w, scan_yaw);
+        bool suppress_blind_precharge = movement.suppress_blind_precharge();
+        CombatDecision cd = combat.decide(obs, self, tracker, cfg, w, scan_yaw, suppress_blind_precharge);
         MoveDecision md = movement.decide(self, tracker, cd, cfg, w);
 
         Json out = Json::object();
@@ -68,16 +69,20 @@ public:
         out.set("tick", obs["tick"].as_i64(0));
 
         Json mv = Json::array();
-        mv.push(md.move.x);
-        mv.push(md.move.y);
+        double mx = std::isfinite(md.move.x) ? md.move.x : 0.0;
+        double my = std::isfinite(md.move.y) ? md.move.y : 0.0;
+        mv.push(mx);
+        mv.push(my);
         out.set("move", std::move(mv));
 
         if (md.boost) out.set("boost", true);
         if (md.jump) out.set("jump", true);
 
         Json am = Json::array();
-        am.push(cd.aim_yaw);
-        am.push(clamp_val(cd.aim_pitch, self.min_pitch, self.max_pitch));
+        double ay = std::isfinite(cd.aim_yaw) ? cd.aim_yaw : self.aim_yaw;
+        double ap = std::isfinite(cd.aim_pitch) ? cd.aim_pitch : self.aim_pitch;
+        am.push(ay);
+        am.push(clamp_val(ap, self.min_pitch, self.max_pitch));
         out.set("aim", std::move(am));
 
         Json fr = Json::array();

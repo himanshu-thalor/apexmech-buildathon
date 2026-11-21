@@ -7,6 +7,7 @@
 #include "world.hpp"
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <vector>
 
 namespace mf {
@@ -45,6 +46,15 @@ public:
     RoofSpot climb_target;
     double climb_start_t = -999.0;
 
+    // Mode memory, persistent explorer & unreachable roof blacklist
+    StrategicMode last_mode = StrategicMode::CombatEngage;
+    std::unordered_map<int, double> blacklisted_roofs;
+
+    Vec2 explore_goal = {0.0, 0.0};
+    bool has_explore_goal = false;
+    double explore_set_t = -999.0;
+    int explore_idx = 0;
+
     // Stateful strafe & anti-stuck tracker
     double strafe_sign = 1.0;
     double next_strafe_flip_t = 1.3;
@@ -54,6 +64,14 @@ public:
     double stuck_escape_yaw = 0.0;
     int stuck_count = 0;
 
+    bool suppress_blind_precharge() const {
+        return climbing_roof ||
+               last_mode == StrategicMode::ZoneRotate ||
+               last_mode == StrategicMode::RegenCover ||
+               last_mode == StrategicMode::SupplyDrop ||
+               last_mode == StrategicMode::LootWeapon;
+    }
+
     void reset() {
         cached_path.clear();
         cached_goal = {1e9, 1e9};
@@ -61,6 +79,11 @@ public:
         has_cached_cover = false;
         last_cover_t = -999.0;
         climbing_roof = false;
+        last_mode = StrategicMode::CombatEngage;
+        blacklisted_roofs.clear();
+        has_explore_goal = false;
+        explore_set_t = -999.0;
+        explore_idx = 0;
         strafe_sign = 1.0;
         next_strafe_flip_t = 1.3;
         stuck_ref_t = -999.0;
@@ -96,6 +119,9 @@ public:
                 stuck_escape_until = t + 0.85;
                 stuck_escape_yaw = wrap_angle(self.aim_yaw + (stuck_count % 2 == 0 ? 1.7 : -1.7));
                 cached_path.clear();
+                if (climbing_roof) {
+                    blacklisted_roofs[climb_target.prism_id] = t + 35.0;
+                }
                 climbing_roof = false;
             }
             stuck_ref_pos = self.pos;
@@ -115,9 +141,13 @@ public:
         // 1. Check active rooftop climb completion / abort
         if (climbing_roof) {
             double r_dist = (my_xy - climb_target.roof_pos.xy()).len();
+            bool climb_timeout = ((t - climb_start_t) > 7.5);
             if (self.grounded && self.pos.z >= climb_target.roof_pos.z - 0.6 && r_dist < 14.0) {
                 climbing_roof = false;
-            } else if ((t - climb_start_t) > 7.5 || self.energy < 6.0 || zone_urgent) {
+            } else if (climb_timeout || self.energy < 6.0 || zone_urgent) {
+                if (climb_timeout || self.energy < 6.0) {
+                    blacklisted_roofs[climb_target.prism_id] = t + 35.0;
+                }
                 climbing_roof = false;
             }
         }
@@ -203,6 +233,39 @@ public:
         bool safe_cube_grab = best_cube &&
             (best_cube_d < 22.0 || (!tracker.enemy_within(best_cube->pos, 32.0) && best_cube_d < (active_mechs.empty() ? max_cube_seek : 48.0)));
 
+        // Persistent golden-angle explorer helper (replaces 61 m/s spinning orbit!)
+        auto get_explore_goal = [&]() -> Vec2 {
+            double safe_r = std::max(10.0, tracker.zone.next_radius - 18.0);
+            if (!has_explore_goal ||
+                (my_xy - explore_goal).len() < 24.0 ||
+                (t - explore_set_t) > 13.0 ||
+                (explore_goal - tracker.zone.next_center).len() > safe_r) {
+                for (int tries = 0; tries < 6; ++tries) {
+                    ++explore_idx;
+                    double ang = self.id * 1.13 + explore_idx * 2.39996323;
+                    double frac = (explore_idx % 2 == 0) ? 0.68 : 0.34;
+                    double r = std::min(safe_r, std::min(tracker.zone.next_radius * frac, 195.0));
+                    Vec2 cand = tracker.zone.next_center + Vec2(std::cos(ang), std::sin(ang)) * r;
+                    int nidx = world.find_nearest_walkable_cell(cand.x, cand.y, self.radius, self.height);
+                    if (nidx >= 0) {
+                        Vec2 nw = world.nav_to_world(nidx % world.nav_nx, nidx / world.nav_nx);
+                        if ((nw - my_xy).len() > 40.0 || tries == 5) {
+                            explore_goal = nw;
+                            has_explore_goal = true;
+                            explore_set_t = t;
+                            break;
+                        }
+                    }
+                }
+                if (!has_explore_goal) {
+                    explore_goal = tracker.zone.next_center;
+                    has_explore_goal = true;
+                    explore_set_t = t;
+                }
+            }
+            return explore_goal;
+        };
+
         // Select strategic goal
         Vec2 goal = tracker.zone.next_center;
         StrategicMode mode = StrategicMode::CombatEngage;
@@ -263,21 +326,28 @@ public:
                 bool charging_laser = (has_laser && self.weapons[self.find_weapon("laser")].charge > 0.0);
 
                 if (!has_laser && (los_enemies >= 2 || primary->has_weapon("laser") || self.hp < 0.78 * self.max_hp)) {
-                    if (!has_cached_cover || (t - last_cover_t) > 0.75) {
-                        Vec2 cover_pt;
-                        if (world.find_cover_pos(self.pos, threat_positions, tracker.zone.next_center, tracker.zone.next_radius, 42.0, cover_pt)) {
-                            cached_cover = cover_pt;
-                            has_cached_cover = true;
-                            last_cover_t = t;
-                        } else {
-                            has_cached_cover = false;
-                        }
-                    }
-                    if (has_cached_cover) {
-                        goal = cached_cover;
+                    if (los_enemies == 0 && !tracker.enemy_within(self.pos, 48.0)) {
+                        // Already broke LOS without a laser: actively roam to find a laser instead of freezing!
+                        mode = StrategicMode::LootWeapon;
+                        goal = get_explore_goal();
+                        if (self.energy > 45.0) want_boost = true;
                     } else {
-                        Vec2 away = (my_xy - primary->pos.xy()).normalized();
-                        goal = clamp_to_zone(my_xy + away * 28.0, tracker.zone.next_center, std::max(5.0, tracker.zone.next_radius - 10.0));
+                        if (!has_cached_cover || (t - last_cover_t) > 0.75) {
+                            Vec2 cover_pt;
+                            if (world.find_cover_pos(self.pos, threat_positions, tracker.zone.next_center, tracker.zone.next_radius, 42.0, cover_pt)) {
+                                cached_cover = cover_pt;
+                                has_cached_cover = true;
+                                last_cover_t = t;
+                            } else {
+                                has_cached_cover = false;
+                            }
+                        }
+                        if (has_cached_cover) {
+                            goal = cached_cover;
+                        } else {
+                            Vec2 away = (my_xy - primary->pos.xy()).normalized();
+                            goal = clamp_to_zone(my_xy + away * 28.0, tracker.zone.next_center, std::max(5.0, tracker.zone.next_radius - 10.0));
+                        }
                     }
                 } else if (combat.laser_cooling && !charging_laser && los_enemies > 0) {
                     if (!has_cached_cover || (t - last_cover_t) > 0.7) {
@@ -330,8 +400,9 @@ public:
                 if (farm_wanted) {
                     for (const auto& kv : tracker.crates) {
                         if (std::abs(kv.second.pos.z - self.pos.z) > 4.5 && !on_roof) continue;
+                        if ((kv.second.pos.xy() - tracker.zone.next_center).len() >= tracker.zone.next_radius) continue;
                         double d = (kv.second.pos.xy() - my_xy).len();
-                        if (d < 150.0 && (kv.second.pos.xy() - tracker.zone.next_center).len() < tracker.zone.next_radius && d < farm_crate_d) {
+                        if (d < 150.0 && d < farm_crate_d) {
                             farm_crate_d = d;
                             farm_crate = &kv.second;
                         }
@@ -370,9 +441,8 @@ public:
                     if (has_snd) {
                         goal = clamp_to_zone(snd_pt, tracker.zone.next_center, std::max(8.0, tracker.zone.next_radius - 12.0));
                     } else {
-                        double orbit_ang = t * (need_laser ? 0.35 : 0.16) + self.id * 0.4;
-                        double orbit_r = std::min(tracker.zone.next_radius * 0.65, 175.0);
-                        goal = tracker.zone.next_center + Vec2(std::cos(orbit_ang), std::sin(orbit_ang)) * orbit_r;
+                        goal = get_explore_goal();
+                        if (need_laser && self.energy > 45.0 && los_enemies == 0) want_boost = true;
                     }
                 } else {
                     mode = on_roof ? StrategicMode::RoofControl : StrategicMode::CombatEngage;
@@ -388,6 +458,7 @@ public:
 
         out.mode = mode;
         out.goal = goal;
+        last_mode = mode;
 
         if (on_roof && !climbing_roof && (goal - my_xy).len() < 3.0) {
             goal = my_xy;
@@ -453,6 +524,11 @@ public:
             }
         }
 
+        // Prevent accidental midair jetpack launches when not climbing a roof or escaping outside the zone
+        if (!self.grounded && !climbing_roof && self.in_zone && mode != StrategicMode::ZoneRotate) {
+            want_boost = false;
+        }
+
         out.move = best_dir;
         out.boost = want_boost;
         out.jump = want_jump;
@@ -486,6 +562,8 @@ private:
         double best_sc = -1e9;
         bool found = false;
         for (const RoofSpot& rs : world.roof_spots) {
+            auto bit = blacklisted_roofs.find(rs.prism_id);
+            if (bit != blacklisted_roofs.end() && tracker.t < bit->second) continue;
             if (rs.climb_dz > 40.0 || rs.climb_dz < 6.0) continue;
             double d = (rs.approach_pos.xy() - self.pos.xy()).len();
             if (d > 80.0) continue;
