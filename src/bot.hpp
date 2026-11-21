@@ -24,12 +24,30 @@ public:
 
     double scan_yaw = 0.0;
     bool initialized = false;
+    const World* shared_world = nullptr;
+
+    const World& active_world() const {
+        return shared_world ? *shared_world : world;
+    }
+
+    void init_shared(int slot_, uint64_t seed_, const GameConfig& cfg_, const World* w_) {
+        slot = slot_;
+        seed = seed_;
+        cfg = cfg_;
+        shared_world = w_;
+        scan_yaw = 0.0;
+        tracker = Tracker{};
+        combat = CombatPlanner{};
+        movement.reset();
+        initialized = true;
+    }
 
     void init(const Json& hello) {
         slot = hello["slot"].as_int(0);
         seed = static_cast<uint64_t>(hello["seed"].as_i64(0));
         cfg = GameConfig::from_json(hello["config"]);
         std::string map_dir = hello["map"]["dir"].as_str("");
+        shared_world = nullptr;
         world.load(map_dir);
         scan_yaw = 0.0;
         movement.reset();
@@ -37,12 +55,13 @@ public:
     }
 
     Json act(const Json& obs) {
+        const World& w = active_world();
         SelfState self = Tracker::parse_self(obs["self"], cfg);
-        tracker.update(obs, self, cfg, world);
+        tracker.update(obs, self, cfg, w);
 
-        scan_yaw = wrap_angle(scan_yaw + 0.18);
-        CombatDecision cd = combat.decide(obs, self, tracker, cfg, world, scan_yaw);
-        MoveDecision md = movement.decide(self, tracker, cd, cfg, world);
+        scan_yaw = wrap_angle(scan_yaw + 0.28);
+        CombatDecision cd = combat.decide(obs, self, tracker, cfg, w, scan_yaw);
+        MoveDecision md = movement.decide(self, tracker, cd, cfg, w);
 
         Json out = Json::object();
         out.set("type", "action");

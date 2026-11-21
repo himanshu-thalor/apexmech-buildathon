@@ -29,7 +29,7 @@ struct CombatDecision {
 
 class CombatPlanner {
 public:
-    bool prefer_lightning_secondary = true;
+    bool prefer_lightning_secondary = false;
 
     int choose_upgrade(
         const Json& offer,
@@ -44,52 +44,57 @@ public:
         bool has_light = (self.find_weapon("lightning") >= 0);
         bool has_gun = (self.find_weapon("gun") >= 0);
         bool has_mortar = (self.find_weapon("mortar") >= 0);
+        bool has_nanites = false;
+        for (const auto& u : self.upgrades) {
+            if (u == "nanites") { has_nanites = true; break; }
+        }
+        bool is_confirmed_ffa = (tracker.ffa_confidence > 0.55);
 
         int best_idx = 0;
         double best_score = -1e9;
         for (size_t i = 0; i < choices.size(); ++i) {
             const std::string& id = choices[i]["id"].as_str();
             double sc = 10.0;
-            if (id == "nanites") {
-                sc = 115.0; // 115 HP/s after 2s at 2 stacks is game-winning
-            } else if (id == "armor") {
-                sc = 108.0;
-            } else if (id == "plating") {
-                sc = 96.0 + (self.hp < 0.7 * self.max_hp ? 14.0 : 0.0);
-            } else if (id == "laser_damage") {
-                sc = has_laser ? 105.0 : 40.0;
-            } else if (id == "laser_charge") {
-                sc = has_laser ? 102.0 : 40.0;
-            } else if (id == "servos") {
-                sc = 88.0;
-            } else if (id == "lightning_range") {
-                sc = has_light ? 84.0 : 25.0;
-            } else if (id == "lightning_efficiency") {
-                sc = has_light ? 80.0 : 25.0;
-            } else if (id == "lightning_chain") {
-                sc = has_light ? (55.0 + 35.0 * (1.0 - tracker.ffa_confidence)) : 20.0;
-            } else if (id == "laser_pierce") {
-                sc = has_laser ? (62.0 + 20.0 * (1.0 - tracker.ffa_confidence)) : 20.0;
-            } else if (id == "gun_damage") {
-                sc = has_gun ? (prefer_lightning_secondary ? 58.0 : 86.0) : 15.0;
-            } else if (id == "gun_rate") {
-                sc = has_gun ? (prefer_lightning_secondary ? 56.0 : 84.0) : 15.0;
-            } else if (id == "gun_velocity") {
-                sc = has_gun ? (prefer_lightning_secondary ? 48.0 : 72.0) : 15.0;
-            } else if (id == "gun_mag") {
-                sc = has_gun ? (prefer_lightning_secondary ? 44.0 : 68.0) : 15.0;
-            } else if (id == "reactor") {
-                sc = 72.0;
-            } else if (id == "jets") {
-                sc = 66.0;
-            } else if (id == "gyros") {
-                sc = 62.0;
-            } else if (id == "sensors") {
-                sc = 54.0;
-            } else if (id == "capacitor") {
-                sc = 50.0;
-            } else if (id.rfind("mortar_", 0) == 0) {
-                sc = has_mortar ? 12.0 : 5.0;
+            if (!is_confirmed_ffa) {
+                // Practice 1v15 curve (U3: 4.08 Practice_48)
+                if (id == "laser_damage") sc = has_laser ? 120.0 : 40.0;
+                else if (id == "laser_charge") sc = has_laser ? 118.0 : 40.0;
+                else if (id == "nanites") sc = 115.0;
+                else if (id == "plating") sc = 108.0 + (self.hp < 0.7 * self.max_hp ? 10.0 : 0.0);
+                else if (id == "gun_damage") sc = has_gun ? 102.0 : 15.0;
+                else if (id == "gun_rate") sc = has_gun ? 100.0 : 15.0;
+                else if (id == "armor") sc = 96.0;
+                else if (id == "servos") sc = 94.0;
+                else if (id == "gun_mag") sc = has_gun ? 86.0 : 15.0;
+                else if (id == "gun_velocity") sc = has_gun ? 84.0 : 15.0;
+                else if (id == "laser_pierce") sc = has_laser ? 82.0 : 20.0;
+                else if (id == "sensors") sc = 72.0;
+                else if (id == "reactor") sc = 64.0;
+                else if (id == "jets") sc = 60.0;
+                else if (id == "gyros") sc = 56.0;
+                else if (id == "capacitor") sc = 48.0;
+                else if (id.rfind("lightning_", 0) == 0) sc = has_light ? 75.0 : 20.0;
+                else if (id.rfind("mortar_", 0) == 0) sc = has_mortar ? 12.0 : 5.0;
+            } else {
+                // Confirmed FFA / League curve (nanites first stack -> armor + laser burst)
+                if (id == "nanites") sc = (!has_nanites) ? 126.0 : 115.0;
+                else if (id == "laser_damage") sc = has_laser ? (has_nanites ? 120.0 : 106.0) : 40.0;
+                else if (id == "laser_charge") sc = has_laser ? (has_nanites ? 118.0 : 103.0) : 40.0;
+                else if (id == "armor") sc = 110.0;
+                else if (id == "plating") sc = 98.0 + (self.hp < 0.7 * self.max_hp ? 12.0 : 0.0);
+                else if (id == "servos") sc = 90.0;
+                else if (id == "gun_damage") sc = has_gun ? 88.0 : 15.0;
+                else if (id == "gun_rate") sc = has_gun ? 86.0 : 15.0;
+                else if (id == "gun_mag") sc = has_gun ? 82.0 : 15.0;
+                else if (id == "gun_velocity") sc = has_gun ? 80.0 : 15.0;
+                else if (id == "reactor") sc = 72.0;
+                else if (id == "jets") sc = 66.0;
+                else if (id == "gyros") sc = 62.0;
+                else if (id == "laser_pierce") sc = has_laser ? 62.0 : 20.0;
+                else if (id == "sensors") sc = 58.0;
+                else if (id == "capacitor") sc = 50.0;
+                else if (id.rfind("lightning_", 0) == 0) sc = has_light ? 80.0 : 25.0;
+                else if (id.rfind("mortar_", 0) == 0) sc = has_mortar ? 12.0 : 5.0;
             }
             if (sc > best_score) {
                 best_score = sc;
@@ -104,7 +109,7 @@ public:
         if (prefer_lightning_secondary) {
             if (kind == "lightning") return 80;
             if (kind == "gun") return 60;
-            if (kind == "mortar") return 10; // avoid cookoff!
+            if (kind == "mortar") return 10;
         } else {
             if (kind == "gun") return 80;
             if (kind == "lightning") return 60;
@@ -138,15 +143,13 @@ public:
         // Weapon loot take/swap (strictly enforce protocol constraints)
         handle_weapon_loot(obs, self, cfg, out);
 
-        // If carrying an unwanted mortar while not charging/in-duel and another valid weapon isn't available,
-        // wait: drop mortar proactively ONLY if we have another weapon and an enemy with laser is visible!
-        if (mortar_slot >= 0 && (laser_slot >= 0 || gun_slot >= 0 || light_slot >= 0)) {
+        // Drop mortar proactively if we have another weapon and an enemy with laser is visible
+        if (mortar_slot >= 0 && (laser_slot >= 0 || gun_slot >= 0 || light_slot >= 0) &&
+            out.take_pickup_id < 0 && !(self.weapons[mortar_slot].charge > 0.0)) {
             for (const auto& kv : tracker.actors) {
                 if (kv.second.is_mech && kv.second.in_obs_now && kv.second.has_weapon("laser")) {
-                    if (out.take_pickup_id < 0 && !(self.weapons[mortar_slot].charge > 0.0)) {
-                        out.drop_slot = mortar_slot;
-                        break;
-                    }
+                    out.drop_slot = mortar_slot;
+                    break;
                 }
             }
         }
@@ -161,7 +164,8 @@ public:
 
         // Check Regen Hold: avoid resetting our 5s regen timer with non-urgent crate/NPC shots when wounded
         int los_enemies = tracker.count_enemies_with_los(self, cfg, world);
-        bool regen_hold_farm = (self.hp < 0.80 * self.max_hp) ||
+        bool regen_hold_farm = (self.cubes >= 21) ||
+                               (self.hp < 0.80 * self.max_hp) ||
                                (los_enemies > 0) ||
                                tracker.enemy_within(self.pos, 95.0);
         // Also avoid resetting regen timer with low-value chip shots when fleeing behind cover at low HP
@@ -178,39 +182,64 @@ public:
         for (const auto& kv : tracker.actors) {
             const TrackedActor& a = kv.second;
             if (!a.is_mech || !a.in_obs_now) continue;
-            Vec3 tc = a.center_pos(cfg);
+            Vec3 tc = a.aim_pos(cfg);
             double dist = (tc - self.muzzle_pivot()).len();
             if (dist > 310.0) continue;
 
             bool los = a.in_solid_los;
-            double sc = 100.0 - dist * 0.45;
-            if (los) sc += 520.0; // Always prioritize enemies who actually have direct LOS to shoot us!
+            double sc = 100.0 - dist * 0.42;
+            if (los) sc += 560.0; // Prioritize enemies with direct solid muzzle LOS!
 
-            // Killable in one laser or quick burst
+            // Killable in one laser or quick burst -> finish the kill!
             double laser_dmg = (laser_slot >= 0) ? self.weapons[laser_slot].stats.damage * dmg_mult : 0.0;
             if (a.has_weapon("mortar") && laser_slot >= 0) {
                 laser_dmg *= (1.0 + self.weapons[laser_slot].stats.cookoff);
-                sc += 45.0; // Cookoff advantage!
+                sc += 55.0; // Cookoff advantage!
             }
-            if (a.hp <= std::max(120.0, laser_dmg)) sc += 160.0;
-            else sc += clamp_val((cfg.mech_hp - a.hp) * 0.08, 0.0, 95.0);
+            if (a.hp <= std::max(140.0, laser_dmg * 0.95)) sc += 360.0;
+            else sc += clamp_val((1.0 - a.hp / std::max(1.0, a.max_hp)) * 220.0, 0.0, 220.0);
 
-            if ((tracker.t - a.damaged_us_t) < 2.5) sc += 80.0;
+            if ((tracker.t - a.damaged_us_t) < 2.5) sc += 85.0;
             if (a.id == tracker.last_attacker_id) sc += 30.0;
             if (a.charging && light_slot >= 0 && dist <= self.weapons[light_slot].stats.range + 10.0) {
-                sc += 95.0; // Short their laser!
+                sc += 110.0; // Short their laser!
             }
 
             // Rear-armor bonus check: angle from target to us vs target aim
             double bearing_to_us = std::atan2(self.pos.y - a.pos.y, self.pos.x - a.pos.x);
             if (std::abs(angle_diff(bearing_to_us, a.aim_yaw)) > deg_to_rad(95.0)) {
-                sc += 40.0;
+                sc += 45.0;
             }
 
             if (sc > best_mech_score) {
                 best_mech_score = sc;
                 best_mech_id = a.id;
                 best_mech = &a;
+            }
+        }
+
+        // Defend against an aggroed NPC shooting us if no mech has LOS & no mech is close
+        if (los_enemies == 0 && !tracker.enemy_within(self.pos, 80.0)) {
+            const TrackedActor* danger_npc = nullptr;
+            double best_nd = ((tracker.t - tracker.last_npc_damaged_t) < 2.0) ? 65.0 : 46.0;
+            for (const auto& kv : tracker.actors) {
+                const TrackedActor& a = kv.second;
+                if (a.is_mech || !a.in_obs_now || !a.in_solid_los) continue;
+                double d = (a.pos - self.pos).len();
+                if (d < best_nd && (self.hp >= 0.35 * self.max_hp || (tracker.t - tracker.last_npc_damaged_t) < 2.0)) {
+                    best_nd = d;
+                    danger_npc = &a;
+                }
+            }
+            if (danger_npc != nullptr && (laser_slot < 0 || self.weapons[laser_slot].charge <= 0.0)) {
+                bool suppress_laser = (self.hp < 0.85 * self.max_hp) && (gun_slot >= 0 || light_slot >= 0);
+                aim_and_fire_target(
+                    danger_npc->pos, danger_npc->vel,
+                    cfg.npc_radius, cfg.npc_height,
+                    danger_npc->hp, false, false, true, 0.50, {0, 0, 0},
+                    self, tracker, world, muzzle_offset, dmg_mult, shorted || suppress_laser, out
+                );
+                return out;
             }
         }
 
@@ -233,7 +262,7 @@ public:
                 best_mech->radius(cfg), best_mech->height(cfg),
                 best_mech->hp, best_mech->is_mech,
                 best_mech->has_weapon("mortar"),
-                best_mech->in_solid_los,
+                best_mech->in_solid_los, best_mech->best_aim_z_frac, best_mech->accel,
                 self, tracker, world, muzzle_offset, dmg_mult, shorted, out
             );
             // Rear armor protection: if primary has NO LOS right now and we're not holding laser charge,
@@ -253,7 +282,7 @@ public:
             // Check visible NPCs (only fight NPCs when healthy!)
             const TrackedActor* best_npc = nullptr;
             double best_npc_d = 1e9;
-            if (self.hp >= 0.82 * self.max_hp) {
+            if (self.hp >= 0.80 * self.max_hp) {
                 for (const auto& kv : tracker.actors) {
                     const TrackedActor& a = kv.second;
                     if (a.is_mech || !a.in_obs_now || !a.in_solid_los) continue;
@@ -279,13 +308,13 @@ public:
                 }
             }
 
-            bool farm_priority = (self.cubes < 14 || best_crate_d < 45.0 || best_npc_d < 55.0);
+            bool farm_priority = (self.cubes < 21 || best_crate_d < 45.0 || best_npc_d < 55.0);
             if (farm_priority && (best_crate || best_npc)) {
                 if (best_crate && (!best_npc || best_crate_d < best_npc_d + 20.0)) {
                     aim_and_fire_target(
                         best_crate->pos, {0, 0, 0},
                         cfg.crate_radius, cfg.crate_height,
-                        best_crate->hp, false, false, true,
+                        best_crate->hp, false, false, true, 0.50, {0, 0, 0},
                         self, tracker, world, muzzle_offset, dmg_mult, shorted, out
                     );
                     return out;
@@ -293,7 +322,7 @@ public:
                     aim_and_fire_target(
                         best_npc->pos, best_npc->vel,
                         cfg.npc_radius, cfg.npc_height,
-                        best_npc->hp, false, false, true,
+                        best_npc->hp, false, false, true, 0.50, {0, 0, 0},
                         self, tracker, world, muzzle_offset, dmg_mult, shorted, out
                     );
                     return out;
@@ -374,7 +403,7 @@ private:
             if (self.find_weapon(kind) >= 0) continue;
 
             int des = weapon_desirability(kind);
-            if (des <= 20) continue; // Skip mortar!
+            if (des <= 20) continue; // Skip unwanted mortar!
 
             int empty = self.empty_slot();
             if (empty >= 0) {
@@ -418,6 +447,8 @@ private:
         bool is_mech,
         bool target_has_mortar,
         bool has_los,
+        double aim_z_frac,
+        const Vec3& target_accel,
         const SelfState& self,
         const Tracker& tracker,
         const World& world,
@@ -427,7 +458,7 @@ private:
         CombatDecision& out
     ) const {
         Vec3 pivot = self.muzzle_pivot();
-        Vec3 target_com = {target_pos.x, target_pos.y, target_pos.z + 0.5 * target_h};
+        Vec3 target_com = {target_pos.x, target_pos.y, target_pos.z + aim_z_frac * target_h};
         double dist = (target_com - pivot).len();
 
         int laser_slot = self.find_weapon("laser");
@@ -438,20 +469,8 @@ private:
         // Actual slewed aim direction right now
         Vec3 actual_dir = vec_from_yaw_pitch(self.aim_yaw, self.aim_pitch);
         Vec3 actual_origin = pivot + actual_dir * std::min(muzzle_offset, std::max(0.0, dist - 0.5));
-        double actual_wall_t = 1e9;
-        bool wall_hit = world.raycast_solid(actual_origin, actual_dir, dist + 2.0, &actual_wall_t);
 
-        // Check if actual aim currently intersects target cylinder (with slight margin for spread/tick)
-        double cyl_hit_t = 1e9;
-        Vec3 pred_05 = target_pos + target_vel * 0.05;
-        bool actual_hits_cyl = ray_cylinder_hit(
-            actual_origin, actual_dir, dist + target_r + 2.0,
-            pred_05.x, pred_05.y, pred_05.z, pred_05.z + target_h,
-            target_r * 0.92, &cyl_hit_t
-        );
-        bool actual_laser_clear = actual_hits_cyl && (!wall_hit || cyl_hit_t < actual_wall_t);
-
-        // 1. LASER LOGIC
+        // 1. LASER LOGIC with exact 1-tick (0.05s) forward slew & motion release predictor
         bool laser_aim_priority = false;
         if (laser_slot >= 0 && !shorted) {
             const auto& lw = self.weapons[laser_slot];
@@ -468,24 +487,56 @@ private:
                 Vec3 aim_tgt = target_com + target_vel * 0.05;
                 yaw_pitch_from_vec(aim_tgt - pivot, out.aim_yaw, out.aim_pitch);
 
-                bool kill_now = (lw.charge >= min_charge_s && target_hp <= cur_dmg * 0.96);
+                // Predict exact state at t + 0.05s (when fire=false fires)
+                const double dt1 = 0.05;
+                double dy = angle_diff(out.aim_yaw, self.aim_yaw);
+                double max_dy = self.turn_rate * dt1;
+                double pred_yaw = wrap_angle(self.aim_yaw + clamp_val(dy, -max_dy, max_dy));
+                double dp = clamp_val(out.aim_pitch, self.min_pitch, self.max_pitch) - self.aim_pitch;
+                double max_dp = self.pitch_rate * dt1;
+                double pred_pitch = clamp_val(self.aim_pitch + clamp_val(dp, -max_dp, max_dp), self.min_pitch, self.max_pitch);
+
+                Vec3 pred_self = self.pos + self.vel * dt1;
+                if (self.grounded) pred_self.z = self.pos.z;
+                Vec3 pred_pivot(pred_self.x, pred_self.y, pred_self.z + self.muzzle_height);
+                Vec3 pred_dir = vec_from_yaw_pitch(pred_yaw, pred_pitch);
+                double wt_off = muzzle_offset;
+                if (world.raycast_solid(pred_pivot, pred_dir, muzzle_offset, &wt_off)) {
+                    wt_off = std::max(0.1, wt_off - 0.05);
+                }
+                Vec3 pred_orig = pred_pivot + pred_dir * wt_off;
+                double pred_wall_t = 1e9;
+                bool pred_wall_hit = world.raycast_solid(pred_orig, pred_dir, dist + target_r + 2.0, &pred_wall_t);
+
+                Vec3 pred_tgt = target_pos + target_vel * dt1;
+                double pred_cyl_t = 1e9;
+                bool pred_hits_cyl = ray_cylinder_hit(
+                    pred_orig, pred_dir, dist + target_r + 2.0,
+                    pred_tgt.x, pred_tgt.y, pred_tgt.z, pred_tgt.z + target_h,
+                    target_r * 0.94, &pred_cyl_t
+                );
+                bool next_laser_clear = pred_hits_cyl && (!pred_wall_hit || pred_cyl_t < pred_wall_t);
+
+                Vec3 future_tgt_aim(pred_tgt.x + target_vel.x * 0.12, pred_tgt.y + target_vel.y * 0.12, pred_tgt.z + aim_z_frac * target_h);
+                bool about_to_lose_los = is_mech && lw.charge >= 0.48 && !world.has_solid_los(pred_orig, future_tgt_aim);
+
+                bool kill_now = (lw.charge >= min_charge_s && target_hp <= cur_dmg * 0.80);
                 bool full_now = (lw.charge >= full_charge_s - 0.015);
                 bool timeout_soon = (lw.charge >= full_charge_s + lw.stats.hold_s - 0.25);
 
                 if (timeout_soon) {
                     out.fire[laser_slot] = false; // release before auto-fire
-                } else if ((full_now || kill_now) && actual_laser_clear) {
+                } else if ((full_now || kill_now || about_to_lose_los) && next_laser_clear) {
                     out.fire[laser_slot] = false; // release for hitscan hit!
                 } else {
                     out.fire[laser_slot] = true; // keep charging / holding until aligned!
                     if (is_mech && !has_los) out.want_peek_for_laser = true;
                 }
-            } else if (lw.cooldown <= 0.12 && dist <= max_r - 2.0) {
+            } else if (lw.cooldown <= 0.14 && dist <= max_r - 2.0) {
                 // Decide whether to start charging laser
                 bool avoid_slow = (is_mech && dist < 44.0 && tracker.enemy_within(self.pos, 44.0) &&
                                    (light_slot >= 0 || self.hp < 0.35 * self.max_hp));
-                // Don't waste laser cooldown on crates if an enemy mech is right nearby
-                bool worth_laser = is_mech || (target_hp >= 180.0 && !tracker.enemy_within(self.pos, 95.0));
+                bool worth_laser = is_mech || (target_hp >= 180.0 && self.hp >= 0.88 * self.max_hp && !tracker.enemy_within(self.pos, 110.0));
                 if (worth_laser && !avoid_slow) {
                     if (has_los) {
                         out.fire[laser_slot] = true;
@@ -496,7 +547,7 @@ private:
                         laser_aim_priority = true;
                         yaw_pitch_from_vec((target_com + target_vel * 0.15) - pivot, out.aim_yaw, out.aim_pitch);
                         if (dist < 130.0) {
-                            out.fire[laser_slot] = true; // pre-charge while stepping out around corner!
+                            out.fire[laser_slot] = true;
                         }
                     }
                 }
@@ -525,17 +576,19 @@ private:
             }
         }
 
-        // 3. GUN LOGIC (lead prediction + LOS check)
+        // 3. GUN LOGIC (adaptive lead prediction + LOS check)
         if (gun_slot >= 0) {
             const auto& gw = self.weapons[gun_slot];
+            double lead_damp = (target_accel.xy().len() > 26.0) ? 0.68 : 0.95;
+            Vec3 lead_vel = target_vel * lead_damp;
             double g_yaw = out.aim_yaw, g_pitch = out.aim_pitch, g_ft = 0.0;
-            solve_gun_lead(pivot, target_com, target_vel, gw.stats.speed, muzzle_offset, g_yaw, g_pitch, g_ft);
+            solve_gun_lead(pivot, target_com, lead_vel, gw.stats.speed, muzzle_offset, g_yaw, g_pitch, g_ft);
             if (!laser_aim_priority && (light_slot < 0 || dist > self.weapons[light_slot].stats.range - 2.0)) {
                 out.aim_yaw = g_yaw;
                 out.aim_pitch = g_pitch;
             }
             if (gw.cooldown <= 0.12 && gw.ammo > 0.0 && gw.reload <= 0.0 && dist <= gw.stats.range - 2.0) {
-                Vec3 pred_pos = target_com + target_vel * g_ft;
+                Vec3 pred_pos = target_com + lead_vel * g_ft;
                 double ang_tol = std::max(0.035, std::atan2(target_r * 1.15, std::max(5.0, dist)));
                 double y_err = std::abs(angle_diff(g_yaw, self.aim_yaw));
                 double p_err = std::abs(g_pitch - self.aim_pitch);

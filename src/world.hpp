@@ -45,6 +45,7 @@ struct RoofSpot {
     Vec3 approach_pos;
     int prism_id = -1;
     double climb_dz = 0.0;
+    double max_edge_dist = 0.0;
 };
 
 class World {
@@ -83,8 +84,10 @@ public:
     std::vector<uint8_t> nav_walkable;
     std::vector<float> nav_ground_z;
     std::vector<float> nav_wall_dist;
+    std::vector<float> nav_ceiling_z;
     std::vector<float> nav_roof_z;
     std::vector<int> nav_roof_prism;
+    std::vector<float> nav_roof_edge_dist;
 
     static std::string join_path(const std::string& a, const std::string& b) {
         if (a.empty()) return b;
@@ -474,17 +477,17 @@ public:
 
         // Terrain ray march over [0, best_t]
         if (terr_nx > 1 && terr_ny > 1 && best_t > 0.05) {
-            double step_t = 2.0;
             double prev_t = 0.0;
             double prev_diff = orig.z - terrain_height(orig.x, orig.y);
             if (prev_diff < -0.05) {
-                // Started underground; immediately blocked
                 if (out_t) *out_t = 0.0;
                 if (out_prism) *out_prism = -1;
                 return true;
             }
-            for (double t = step_t; ; t += step_t) {
-                double tc = std::min(t, best_t);
+            double t = 0.0;
+            while (t < best_t) {
+                double step_t = (prev_diff < 5.0 || dir.z < -0.25) ? 1.0 : 2.5;
+                double tc = std::min(t + step_t, best_t);
                 double px = orig.x + tc * dir.x;
                 double py = orig.y + tc * dir.y;
                 double pz = orig.z + tc * dir.z;
@@ -507,6 +510,7 @@ public:
                 if (tc >= best_t) break;
                 prev_t = tc;
                 prev_diff = diff;
+                t = tc;
             }
         }
 
@@ -632,7 +636,14 @@ public:
         return pt_vis(target_center) || pt_vis(target_top);
     }
 
-    bool is_wall_blocked(double x, double y, double feet_z, double radius, double height) const {
+    bool is_wall_blocked(
+        double x,
+        double y,
+        double feet_z,
+        double radius,
+        double height,
+        double step_up = 1.2
+    ) const {
         if (x < min_x + radius || x > max_x - radius || y < min_y + radius || y > max_y - radius) {
             return true;
         }
@@ -642,7 +653,7 @@ public:
         int iy1 = clamp_val_int(static_cast<int>(std::floor((y + radius - grid_oy) / grid_cell)), 0, grid_ny - 1);
         if (grid_nx <= 0 || grid_ny <= 0) return false;
 
-        double z_lo = feet_z + max_step;
+        double z_lo = feet_z + step_up;
         double z_hi = feet_z + height - 0.05;
 
         thread_local std::vector<uint32_t> wstamp;
@@ -688,7 +699,21 @@ public:
         return {nav_ox + ix * nav_step, nav_oy + iy * nav_step};
     }
 
-    bool is_nav_line_walkable(const Vec2& a, const Vec2& b) const {
+    bool is_nav_cell_clear(int idx, double mech_radius, double mech_height) const {
+        if (!nav_walkable[idx]) return false;
+        if (mech_radius > 2.55 && nav_wall_dist[idx] < static_cast<float>(mech_radius + 0.45)) return false;
+        if (mech_height > 9.1 && (nav_ceiling_z[idx] - nav_ground_z[idx]) < static_cast<float>(mech_height + 0.35)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool is_nav_line_walkable(
+        const Vec2& a,
+        const Vec2& b,
+        double mech_radius = 2.5,
+        double mech_height = 9.0
+    ) const {
         double dist = (b - a).len();
         int steps = std::max(2, static_cast<int>(std::ceil(dist / 2.0)));
         for (int i = 0; i <= steps; ++i) {
@@ -696,17 +721,23 @@ public:
             Vec2 p = a + (b - a) * t;
             int ix, iy;
             world_to_nav(p.x, p.y, ix, iy);
-            if (!nav_walkable[static_cast<size_t>(iy) * nav_nx + ix]) return false;
+            int idx = iy * nav_nx + ix;
+            if (!is_nav_cell_clear(idx, mech_radius, mech_height)) return false;
         }
         return true;
     }
 
-    int find_nearest_walkable_cell(double x, double y) const {
+    int find_nearest_walkable_cell(
+        double x,
+        double y,
+        double mech_radius = 2.5,
+        double mech_height = 9.0
+    ) const {
         if (nav_nx <= 0 || nav_ny <= 0) return -1;
         int sx, sy;
         world_to_nav(x, y, sx, sy);
         int sidx = sy * nav_nx + sx;
-        if (nav_walkable[sidx]) return sidx;
+        if (is_nav_cell_clear(sidx, mech_radius, mech_height)) return sidx;
         int best_idx = -1;
         double best_d2 = 1e18;
         for (int r = 1; r <= 12; ++r) {
@@ -716,7 +747,7 @@ public:
                     int nx = sx + dx, ny = sy + dy;
                     if (!nav_in_bounds(nx, ny)) continue;
                     int idx = ny * nav_nx + nx;
-                    if (nav_walkable[idx]) {
+                    if (is_nav_cell_clear(idx, mech_radius, mech_height)) {
                         Vec2 w = nav_to_world(nx, ny);
                         double d2 = (w.x - x) * (w.x - x) + (w.y - y) * (w.y - y);
                         if (d2 < best_d2) {
@@ -728,16 +759,26 @@ public:
             }
             if (best_idx >= 0) return best_idx;
         }
+        // Fallback to any basic walkable cell if mech is very large
+        if (mech_radius > 2.55 || mech_height > 9.1) {
+            return find_nearest_walkable_cell(x, y, 2.5, 9.0);
+        }
         return -1;
     }
 
     // Fast A* on 4m navgrid with string-pulling smoothing. Returns world waypoints (start excluded, goal included).
-    std::vector<Vec2> find_path(const Vec2& start, const Vec2& goal, int max_expansions = 10000) const {
+    std::vector<Vec2> find_path(
+        const Vec2& start,
+        const Vec2& goal,
+        int max_expansions = 10000,
+        double mech_radius = 2.5,
+        double mech_height = 9.0
+    ) const {
         if (nav_nx <= 0 || nav_ny <= 0) return {goal};
-        if (is_nav_line_walkable(start, goal)) return {goal};
+        if (is_nav_line_walkable(start, goal, mech_radius, mech_height)) return {goal};
 
-        int sidx = find_nearest_walkable_cell(start.x, start.y);
-        int gidx = find_nearest_walkable_cell(goal.x, goal.y);
+        int sidx = find_nearest_walkable_cell(start.x, start.y, mech_radius, mech_height);
+        int gidx = find_nearest_walkable_cell(goal.x, goal.y, mech_radius, mech_height);
         if (sidx < 0 || gidx < 0) return {goal};
         if (sidx == gidx) return {goal};
 
@@ -816,13 +857,14 @@ public:
                 int vy = uy + kDy[d];
                 if (!nav_in_bounds(vx, vy)) continue;
                 int v = vy * nav_nx + vx;
-                if (!nav_walkable[v] || closed[v] == gen) continue;
+                if (closed[v] == gen) continue;
+                if (!is_nav_cell_clear(v, mech_radius, mech_height) && v != gidx) continue;
                 // Avoid corner clipping on diagonals
                 if (d >= 4) {
                     if (!nav_walkable[uy * nav_nx + vx] || !nav_walkable[vy * nav_nx + ux]) continue;
                 }
                 // Slight penalty for scraping right next to walls
-                float wall_pen = (nav_wall_dist[v] < 4.5f) ? 0.12f : 0.0f;
+                float wall_pen = (nav_wall_dist[v] < static_cast<float>(mech_radius + 2.0)) ? 0.14f : 0.0f;
                 float ng = g_score[u] + kCost[d] + wall_pen;
                 if (seen[v] != gen || ng < g_score[v]) {
                     seen[v] = gen;
@@ -853,7 +895,7 @@ public:
         while (i < raw.size()) {
             size_t farthest = i;
             for (size_t j = raw.size(); j > i + 1; --j) {
-                if (is_nav_line_walkable(anchor, raw[j - 1])) {
+                if (is_nav_line_walkable(anchor, raw[j - 1], mech_radius, mech_height)) {
                     farthest = j - 1;
                     break;
                 }
@@ -946,6 +988,164 @@ public:
         return false;
     }
 
+    // Finds a tactical cover cell (0 LOS from threats) paired with an adjacent corner/roof-edge
+    // peek cell (direct muzzle LOS to primary, minimal LOS to other threats) for peek-shooting & 1v1 slicing.
+    bool find_tactical_cover(
+        const Vec3& self_pos,
+        const Vec3& primary_aim_pt,
+        int primary_id,
+        const std::vector<Vec3>& threat_eyes,
+        const std::vector<int>& threat_ids,
+        const Vec2& zone_center,
+        double zone_radius,
+        double search_r,
+        double mech_radius,
+        double mech_height,
+        bool on_roof,
+        Vec2& out_cover,
+        Vec2& out_peek,
+        bool& out_has_peek
+    ) const {
+        out_has_peek = false;
+        if (threat_eyes.empty() || nav_nx <= 0) return false;
+
+        int cx, cy;
+        world_to_nav(self_pos.x, self_pos.y, cx, cy);
+        int rad_cells = static_cast<int>(std::ceil(search_r / nav_step));
+        double safe_z_r = std::max(6.0, zone_radius - 6.0);
+
+        struct Cand {
+            double sort_key;
+            double d_self;
+            double z;
+            int idx;
+            Vec2 w;
+        };
+        std::vector<Cand> cands;
+        cands.reserve(160);
+
+        for (int dy = -rad_cells; dy <= rad_cells; ++dy) {
+            for (int dx = -rad_cells; dx <= rad_cells; ++dx) {
+                int nx = cx + dx, ny = cy + dy;
+                if (!nav_in_bounds(nx, ny)) continue;
+                int idx = ny * nav_nx + nx;
+
+                double cz = 0.0;
+                if (on_roof) {
+                    if (nav_roof_prism[idx] < 0) continue;
+                    if (std::abs(nav_roof_z[idx] - self_pos.z) > 2.5) continue;
+                    cz = nav_roof_z[idx];
+                } else {
+                    if (!is_nav_cell_clear(idx, mech_radius, mech_height)) continue;
+                    if (nav_wall_dist[idx] > 12.0f) continue;
+                    cz = nav_ground_z[idx];
+                }
+
+                Vec2 w = nav_to_world(nx, ny);
+                double d_self = std::hypot(w.x - self_pos.x, w.y - self_pos.y);
+                if (d_self > search_r) continue;
+                if (std::hypot(w.x - zone_center.x, w.y - zone_center.y) > safe_z_r) continue;
+
+                double sk = on_roof
+                                ? (d_self + std::abs(nav_roof_edge_dist[idx] - 6.0f) * 0.4)
+                                : (d_self + nav_wall_dist[idx] * 0.35);
+                cands.push_back({sk, d_self, cz, idx, w});
+            }
+        }
+        if (cands.empty()) return false;
+
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            return a.sort_key < b.sort_key;
+        });
+        if (cands.size() > 48) cands.resize(48);
+
+        size_t tlim = std::min<size_t>(threat_eyes.size(), 6);
+        double best_cov_sc = 1e18;
+        int best_cov_ci = -1;
+        double cover_z = self_pos.z;
+
+        for (int ci = 0; ci < static_cast<int>(cands.size()); ++ci) {
+            const Cand& c = cands[ci];
+            Vec3 c_cen(c.w.x, c.w.y, c.z + 0.50 * mech_height);
+            Vec3 c_hi(c.w.x, c.w.y, c.z + 0.80 * mech_height);
+            int vis = 0;
+            for (size_t ti = 0; ti < tlim; ++ti) {
+                if ((threat_eyes[ti].xy() - c.w).len() > 250.0) continue;
+                if (has_solid_los(threat_eyes[ti], c_cen) || has_solid_los(threat_eyes[ti], c_hi)) {
+                    ++vis;
+                }
+            }
+            double sc = vis * 120.0 + c.d_self + (on_roof ? 0.0 : c.d_self * 0.05);
+            if (vis == 0 && !on_roof) {
+                // Slight preference for tight corner cells so peek distance is short
+                sc += nav_wall_dist[c.idx] * 0.3;
+            }
+            if (sc < best_cov_sc) {
+                best_cov_sc = sc;
+                best_cov_ci = ci;
+            }
+            if (vis == 0 && c.d_self <= 8.0) {
+                // Fast early accept when we're already right behind 0-LOS cover!
+                break;
+            }
+        }
+        if (best_cov_ci < 0 || best_cov_sc >= std::max(120.0, tlim * 115.0)) return false;
+
+        out_cover = cands[best_cov_ci].w;
+        cover_z = cands[best_cov_ci].z;
+
+        // Now find a peek cell near out_cover (within 14m of out_cover) that sees primary_aim_pt
+        // while keeping other threats blocked (1v1 isolation)!
+        int cx_cov, cy_cov;
+        world_to_nav(out_cover.x, out_cover.y, cx_cov, cy_cov);
+        double best_pk_sc = 1e18;
+        Vec2 best_pk = out_cover;
+        bool found_pk = false;
+
+        for (int dy = -3; dy <= 3; ++dy) {
+            for (int dx = -3; dx <= 3; ++dx) {
+                int nx = cx_cov + dx, ny = cy_cov + dy;
+                if (!nav_in_bounds(nx, ny)) continue;
+                int idx = ny * nav_nx + nx;
+                double pz = 0.0;
+                if (on_roof) {
+                    if (nav_roof_prism[idx] < 0 || std::abs(nav_roof_z[idx] - cover_z) > 2.0) continue;
+                    pz = nav_roof_z[idx];
+                } else {
+                    if (!is_nav_cell_clear(idx, mech_radius, mech_height)) continue;
+                    pz = nav_ground_z[idx];
+                }
+                Vec2 pw = nav_to_world(nx, ny);
+                double d_cov = (pw - out_cover).len();
+                if (d_cov < 2.5 || d_cov > 13.5) continue;
+                if (std::hypot(pw.x - zone_center.x, pw.y - zone_center.y) > safe_z_r) continue;
+                if (!on_roof && !is_nav_line_walkable(out_cover, pw, mech_radius, mech_height)) continue;
+
+                Vec3 p_muz(pw.x, pw.y, pz + 0.78 * mech_height);
+                if (!has_solid_los(p_muz, primary_aim_pt)) continue;
+
+                // Count OTHER threats that also see this peek cell
+                int other_vis = 0;
+                for (size_t ti = 0; ti < tlim; ++ti) {
+                    if (threat_ids[ti] == primary_id) continue;
+                    if ((threat_eyes[ti].xy() - pw).len() > 250.0) continue;
+                    if (has_solid_los(threat_eyes[ti], p_muz)) ++other_vis;
+                }
+                double pk_sc = other_vis * 100.0 + d_cov * 1.4 + (pw - self_pos.xy()).len() * 0.25;
+                if (pk_sc < best_pk_sc) {
+                    best_pk_sc = pk_sc;
+                    best_pk = pw;
+                    found_pk = true;
+                }
+            }
+        }
+        if (found_pk) {
+            out_peek = best_pk;
+            out_has_peek = true;
+        }
+        return true;
+    }
+
     // Check if (x, y) is safely on top of a climbable roof and return roof_z.
     bool get_roof_at(double x, double y, double& out_roof_z, int& out_prism) const {
         if (nav_nx <= 0 || nav_ny <= 0) return false;
@@ -958,6 +1158,120 @@ public:
             return true;
         }
         return false;
+    }
+
+    // Find a clear walkable ground launch spot without overhangs to jet onto `roof_pt`.
+    bool find_roof_launch_for_point(
+        const Vec3& roof_pt,
+        const Vec3& self_pos,
+        double mech_r,
+        double mech_h,
+        double max_dz,
+        RoofSpot& out_spot
+    ) const {
+        if (nav_nx <= 0 || nav_ny <= 0) return false;
+        int rx = -1, ry = -1;
+        world_to_nav(roof_pt.x, roof_pt.y, rx, ry);
+        int ridx = ry * nav_nx + rx;
+        int rpid = nav_roof_prism[ridx];
+        double rz = nav_roof_z[ridx];
+        if (rpid < 0 || std::abs(rz - roof_pt.z) > 3.5) {
+            // Search 5x5 neighborhood for matching roof cell
+            double best_rd = 1e9;
+            for (int dy = -2; dy <= 2; ++dy) {
+                for (int dx = -2; dx <= 2; ++dx) {
+                    int nx = rx + dx, ny = ry + dy;
+                    if (!nav_in_bounds(nx, ny)) continue;
+                    int idx = ny * nav_nx + nx;
+                    if (nav_roof_prism[idx] >= 0 && std::abs(nav_roof_z[idx] - roof_pt.z) <= 3.5) {
+                        Vec2 w = nav_to_world(nx, ny);
+                        double d = (w - roof_pt.xy()).len();
+                        if (d < best_rd) {
+                            best_rd = d;
+                            rpid = nav_roof_prism[idx];
+                            rz = nav_roof_z[idx];
+                            rx = nx; ry = ny;
+                        }
+                    }
+                }
+            }
+        }
+        if (rpid < 0) return false;
+
+        int best_g = -1;
+        double best_sc = 1e18;
+        for (int dy = -9; dy <= 9; ++dy) {
+            for (int dx = -9; dx <= 9; ++dx) {
+                int nx = rx + dx, ny = ry + dy;
+                if (!nav_in_bounds(nx, ny)) continue;
+                int gidx = ny * nav_nx + nx;
+                if (nav_roof_prism[gidx] >= 0) continue;
+                if (!is_nav_cell_clear(gidx, mech_r, mech_h)) continue;
+                if (nav_ceiling_z[gidx] < rz + mech_h + 1.5) continue; // avoid overhangs!
+
+                double dz = rz - nav_ground_z[gidx];
+                if (dz < 3.0 || dz > max_dz) continue;
+
+                Vec2 gw = nav_to_world(nx, ny);
+                double d_roof = (gw - roof_pt.xy()).len();
+                if (d_roof > 34.0) continue;
+
+                // Ensure no taller building wall sits above roof height between launch and roof_pt
+                Vec2 mid = gw * 0.5 + roof_pt.xy() * 0.5;
+                if (is_wall_blocked(mid.x, mid.y, rz + 0.5, mech_r * 0.85, mech_h, 1.2)) continue;
+
+                double d_self = (gw - self_pos.xy()).len();
+                double sc = d_self + d_roof * 1.45;
+                if (sc < best_sc) {
+                    best_sc = sc;
+                    best_g = gidx;
+                }
+            }
+        }
+        if (best_g < 0) return false;
+
+        Vec2 gw = nav_to_world(best_g % nav_nx, best_g / nav_nx);
+        out_spot.approach_pos = Vec3(gw.x, gw.y, nav_ground_z[best_g]);
+        out_spot.roof_pos = roof_pt;
+        out_spot.prism_id = rpid;
+        out_spot.climb_dz = rz - nav_ground_z[best_g];
+        out_spot.max_edge_dist = 4.0;
+        return true;
+    }
+
+    // Choose a high-value combat rooftop inside next_zone with interior cover & clear launch.
+    bool find_best_combat_roof(
+        const Vec3& self_pos,
+        const Vec2& zone_next_c,
+        double zone_next_r,
+        double max_search_d,
+        double max_dz,
+        double energy,
+        double jet_drain,
+        RoofSpot& out_spot
+    ) const {
+        double best_sc = -1e9;
+        bool found = false;
+        double safe_r = std::max(8.0, zone_next_r - 16.0);
+        for (const RoofSpot& rs : roof_spots) {
+            if (rs.climb_dz < 7.0 || rs.climb_dz > max_dz) continue;
+            if (rs.max_edge_dist < 4.5) continue; // require enough roof width to break ground LOS
+            double d = (rs.approach_pos.xy() - self_pos.xy()).len();
+            if (d > max_search_d) continue;
+            double dz_center = (rs.roof_pos.xy() - zone_next_c).len();
+            if (dz_center > safe_r) continue;
+            double req_e = (rs.climb_dz / 9.2) * jet_drain + 18.0;
+            if (req_e > energy) continue;
+
+            double sc = 120.0 - d * 1.2 + std::min(rs.max_edge_dist, 14.0) * 3.0 - std::abs(rs.climb_dz - 15.0) * 1.3;
+            sc += std::max(0.0, 1.0 - dz_center / safe_r) * 25.0;
+            if (sc > best_sc) {
+                best_sc = sc;
+                out_spot = rs;
+                found = true;
+            }
+        }
+        return found;
     }
 
 private:
@@ -1068,8 +1382,10 @@ private:
         nav_walkable.assign(total, 1);
         nav_ground_z.assign(total, 0.0f);
         nav_wall_dist.assign(total, 999.0f);
+        nav_ceiling_z.assign(total, 1e9f);
         nav_roof_z.assign(total, -1e9f);
         nav_roof_prism.assign(total, -1);
+        nav_roof_edge_dist.assign(total, 0.0f);
 
         std::queue<int> bfs;
         const double clear_r = 2.9;
@@ -1095,6 +1411,7 @@ private:
                 double best_roof = -1e9;
                 int best_rpid = -1;
                 double low_top = tz;
+                double low_ceil = 1e9;
 
                 if (grid_nx > 0 && grid_ny > 0) {
                     const auto& cell = prism_grid[static_cast<size_t>(gy) * grid_nx + gx];
@@ -1108,14 +1425,17 @@ private:
                         double ed = min_dist_to_prism_edges(p, wx, wy);
                         if (inside || ed < clear_r) {
                             // Blocks ground walkability if prism overlaps [tz + 1.2, tz + 8.8]
-                            if (p.top > tz + 1.2 && p.base < tz + 8.8) {
+                            if (p.top > tz + 1.2 && p.base < tz + 8.95) {
                                 blocked = true;
                             }
                             if (inside && p.top <= tz + 1.2 && p.top > low_top) {
                                 low_top = p.top;
                             }
+                            if (p.base > tz + 1.2 && p.base < low_ceil) {
+                                low_ceil = p.base;
+                            }
                         }
-                        if (inside && ed >= 2.8 && p.top > tz + 4.0 && p.top < tz + 52.0) {
+                        if (inside && ed >= 2.6 && p.top > tz + 4.0 && p.top < tz + 54.0) {
                             if (p.top > best_roof) {
                                 best_roof = p.top;
                                 best_rpid = pid;
@@ -1124,6 +1444,7 @@ private:
                     }
                 }
                 nav_ground_z[idx] = static_cast<float>(low_top);
+                nav_ceiling_z[idx] = static_cast<float>(low_ceil);
                 if (best_rpid >= 0) {
                     // Make sure no higher prism blocks standing headroom on this roof cell
                     bool head_blocked = false;
@@ -1170,18 +1491,46 @@ private:
             }
         }
 
-        // Build representative climbable RoofSpot registry (up to 1 spot per roof prism / sub-sector)
+        // Compute distance inside roof from roof edge (used for roof-edge peek cover)
+        std::queue<int> rbfs;
+        for (size_t i = 0; i < total; ++i) {
+            if (nav_roof_prism[i] < 0) {
+                nav_roof_edge_dist[i] = 0.0f;
+                rbfs.push(static_cast<int>(i));
+            } else {
+                nav_roof_edge_dist[i] = 999.0f;
+            }
+        }
+        while (!rbfs.empty()) {
+            int u = rbfs.front();
+            rbfs.pop();
+            int ux = u % nav_nx, uy = u / nav_nx;
+            float nd = nav_roof_edge_dist[u] + static_cast<float>(nav_step);
+            for (int d = 0; d < 4; ++d) {
+                int vx = ux + kDx[d], vy = uy + kDy[d];
+                if (!nav_in_bounds(vx, vy)) continue;
+                int v = vy * nav_nx + vx;
+                if (nav_roof_prism[v] >= 0 && nd < nav_roof_edge_dist[v]) {
+                    nav_roof_edge_dist[v] = nd;
+                    rbfs.push(v);
+                }
+            }
+        }
+
+        // Build representative climbable RoofSpot registry (up to 1 spot per roof prism)
         std::vector<int> best_cell_for_prism(prisms.size(), -1);
         std::vector<double> best_score_for_prism(prisms.size(), -1e9);
+        std::vector<float> max_edge_for_prism(prisms.size(), 0.0f);
         for (int iy = 0; iy < nav_ny; ++iy) {
             for (int ix = 0; ix < nav_nx; ++ix) {
                 int idx = iy * nav_nx + ix;
                 int pid = nav_roof_prism[idx];
                 if (pid < 0) continue;
+                max_edge_for_prism[pid] = std::max(max_edge_for_prism[pid], nav_roof_edge_dist[idx]);
                 double dz = nav_roof_z[idx] - nav_ground_z[idx];
                 if (dz < 5.0 || dz > 48.0) continue;
-                // Find nearest walkable ground cell around it
-                double score = 100.0 - std::abs(dz - 16.0);
+                double ed = nav_roof_edge_dist[idx];
+                double score = 100.0 - std::abs(dz - 16.0) + std::min(ed, 8.0) * 3.0;
                 if (score > best_score_for_prism[pid]) {
                     best_score_for_prism[pid] = score;
                     best_cell_for_prism[pid] = idx;
@@ -1194,15 +1543,16 @@ private:
             if (ridx < 0) continue;
             int rx = ridx % nav_nx, ry = ridx / nav_nx;
             Vec2 rw = nav_to_world(rx, ry);
-            // Find closest walkable ground launch cell within 36m
             int best_g = -1;
             double best_gd2 = 1e18;
+            double rz = nav_roof_z[ridx];
             for (int dy = -9; dy <= 9; ++dy) {
                 for (int dx = -9; dx <= 9; ++dx) {
                     int nx = rx + dx, ny = ry + dy;
                     if (!nav_in_bounds(nx, ny)) continue;
                     int gidx = ny * nav_nx + nx;
-                    if (!nav_walkable[gidx]) continue;
+                    if (!nav_walkable[gidx] || nav_roof_prism[gidx] >= 0) continue;
+                    if (nav_ceiling_z[gidx] < rz + 10.5) continue;
                     Vec2 gw = nav_to_world(nx, ny);
                     double d2 = (gw - rw).len_sq();
                     if (d2 < best_gd2) {
@@ -1214,10 +1564,11 @@ private:
             if (best_g >= 0 && best_gd2 <= 36.0 * 36.0) {
                 Vec2 gw = nav_to_world(best_g % nav_nx, best_g / nav_nx);
                 RoofSpot rs;
-                rs.roof_pos = Vec3(rw.x, rw.y, nav_roof_z[ridx]);
+                rs.roof_pos = Vec3(rw.x, rw.y, rz);
                 rs.approach_pos = Vec3(gw.x, gw.y, nav_ground_z[best_g]);
                 rs.prism_id = static_cast<int>(pid);
                 rs.climb_dz = rs.roof_pos.z - rs.approach_pos.z;
+                rs.max_edge_dist = max_edge_for_prism[pid];
                 roof_spots.push_back(rs);
             }
         }

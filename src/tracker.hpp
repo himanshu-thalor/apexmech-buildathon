@@ -111,8 +111,10 @@ struct TrackedActor {
     bool in_obs_now = false;
     bool actually_seen = false;
     bool in_solid_los = false;
+    double best_aim_z_frac = 0.50;
     double last_seen_t = -999.0;
     double last_obs_t = -999.0;
+    double last_laser_fire_t = -999.0;
 
     double damaged_us_t = -999.0;
     double damage_to_us = 0.0;
@@ -140,6 +142,10 @@ struct TrackedActor {
         return {pos.x, pos.y, pos.z + 0.5 * height(cfg)};
     }
 
+    Vec3 aim_pos(const GameConfig& cfg) const {
+        return {pos.x, pos.y, pos.z + best_aim_z_frac * height(cfg)};
+    }
+
     Vec3 top_pos(const GameConfig& cfg) const {
         return {pos.x, pos.y, pos.z + height(cfg)};
     }
@@ -152,6 +158,7 @@ struct RememberedItem {
     double hp = 300.0;
     double last_seen_t = -999.0;
     bool visible_now = false;
+    bool on_roof = false;
 };
 
 struct ProjectileThreat {
@@ -201,6 +208,7 @@ public:
     double last_combat_t = -999.0;
     double shorted_until_t = -999.0;
     double last_damaged_t = -999.0;
+    double last_npc_damaged_t = -999.0;
     double last_damaged_bearing = 0.0;
     int last_attacker_id = -1;
     bool last_damaged_rear = false;
@@ -209,6 +217,7 @@ public:
     // 0.0 = 1v15 Practice Squad, 1.0 = 16-way FFA
     double ffa_confidence = 0.5;
     bool saw_external_combat = false;
+    double squad_coop_score = 0.0;
 
     std::unordered_map<int, TrackedActor> actors;
     std::unordered_map<int, RememberedItem> crates;
@@ -343,6 +352,9 @@ public:
                     last_damaged_bearing = ev["bearing"].as_double(0.0);
                 }
                 last_damaged_rear = ev["rear"].as_bool(false);
+                if (ev["weapon"].as_str() == "npc") {
+                    last_npc_damaged_t = t;
+                }
                 if (!ev["by"].is_null()) {
                     int by = ev["by"].as_int(-1);
                     last_attacker_id = by;
@@ -352,6 +364,9 @@ public:
                         a.is_mech = true;
                         a.damaged_us_t = t;
                         a.damage_to_us += amt;
+                        if (ev["weapon"].as_str() == "laser") {
+                            a.last_laser_fire_t = t;
+                        }
                     }
                 }
             } else if (et == "hit") {
@@ -432,19 +447,34 @@ public:
                 a.weapons.push_back(wj.as_str());
             }
 
+            bool prev_ch = a.charging;
             bool ch = mj["charging"].as_bool(false);
-            if (ch && !a.charging) {
+            if (ch && !prev_ch) {
                 a.charge_start_t = t;
             } else if (!ch) {
+                if (prev_ch && a.charge_start_t > 0.0 && (t - a.charge_start_t) >= cfg.laser.min_charge) {
+                    a.last_laser_fire_t = std::max(a.last_laser_fire_t, t);
+                }
                 a.charge_start_t = -1.0;
             }
             a.charging = ch;
             a.in_obs_now = true;
             a.last_obs_t = t;
 
+            // Compute exact solid LOS strictly from muzzle_pivot across 3 vertical slices
+            double th = a.height(cfg);
+            a.in_solid_los = false;
+            a.best_aim_z_frac = 0.50;
+            for (double zf : {0.50, 0.78, 0.25}) {
+                Vec3 tp(a.pos.x, a.pos.y, a.pos.z + zf * th);
+                if (world.has_solid_los(my_muzzle, tp)) {
+                    a.in_solid_los = true;
+                    a.best_aim_z_frac = zf;
+                    break;
+                }
+            }
             Vec3 tc = a.center_pos(cfg);
             Vec3 tt = a.top_pos(cfg);
-            a.in_solid_los = world.has_solid_los(my_muzzle, tc) || world.has_solid_los(my_eye, tc);
             a.actually_seen = world.can_see_point(my_eye, tc, tt, near_r, fov_r, self.aim_yaw, cfg.vision_fov_deg, cfg.canopy_blocks);
             if (a.actually_seen) {
                 a.last_seen_t = t;
@@ -460,10 +490,12 @@ public:
             }
         }
 
-        // Beams: detect external combat + track shooter location if unseen
+        // Beams: detect external combat + track shooter location & laser cooldown
         for (const auto& bj : obs["beams"].arr_val) {
             int by = bj["by"].as_int(-1);
             if (by < 0 || by == self.id) continue;
+            double age = bj["age"].as_double(0.0);
+            const std::string& bkind = bj["kind"].as_str();
             const auto& path = bj["path"].arr_val;
             if (!path.empty() && path[0].arr_val.size() >= 3) {
                 Vec3 orig(path[0][0].as_double(), path[0][1].as_double(), path[0][2].as_double());
@@ -476,21 +508,46 @@ public:
                     a.last_obs_t = t;
                     a.last_seen_t = t;
                 }
+                if (bkind == "laser") {
+                    actors[by].last_laser_fire_t = std::max(actors[by].last_laser_fire_t, t - age);
+                }
                 if (path.size() >= 2 && path.back().arr_val.size() >= 3) {
                     Vec3 endp(path.back()[0].as_double(), path.back()[1].as_double(), path.back()[2].as_double());
                     double d_to_us = (endp - self.center_pos()).len();
-                    if (d_to_us > 12.0) {
-                        // Shot aimed far from us -> FFA signal
+                    if (d_to_us > 14.0) {
                         saw_external_combat = true;
                     }
                 }
             }
         }
 
+        // Detect squad cooperation (2+ visible mechs near each other not fighting)
+        if (!saw_external_combat) {
+            std::vector<const TrackedActor*> near_mechs;
+            for (const auto& kv : actors) {
+                if (kv.second.is_mech && kv.second.in_obs_now && (kv.second.pos - self.pos).len() < 165.0) {
+                    near_mechs.push_back(&kv.second);
+                }
+            }
+            bool coop_pair = false;
+            for (size_t i = 0; i < near_mechs.size() && !coop_pair; ++i) {
+                for (size_t j = i + 1; j < near_mechs.size(); ++j) {
+                    if ((near_mechs[i]->pos - near_mechs[j]->pos).len() < 65.0 &&
+                        world.has_solid_los(near_mechs[i]->center_pos(cfg), near_mechs[j]->center_pos(cfg))) {
+                        coop_pair = true;
+                        break;
+                    }
+                }
+            }
+            if (coop_pair) squad_coop_score += dt;
+        }
+
         // FFA vs Practice 1v15 confidence estimate
         int non_me_dead = std::max(0, (cfg.mechs - alive) - my_kills);
-        if (non_me_dead >= 1 || saw_external_combat) {
+        if (saw_external_combat || (non_me_dead >= 1 && t < 110.0)) {
             ffa_confidence = 1.0;
+        } else if (squad_coop_score >= 1.5 && non_me_dead == 0) {
+            ffa_confidence = 0.0;
         } else if (t > 40.0) {
             ffa_confidence = 0.0;
         } else if (t > 20.0) {
@@ -541,12 +598,14 @@ public:
 
     int count_enemies_with_los(const SelfState& self, const GameConfig& cfg, const World& world) const {
         Vec3 my_c = self.center_pos();
+        Vec3 my_top(self.pos.x, self.pos.y, self.pos.z + 0.80 * self.height);
         int cnt = 0;
         for (const auto& kv : actors) {
             const TrackedActor& a = kv.second;
             if (!a.is_mech || !a.in_obs_now) continue;
-            Vec3 e_eye = {a.pos.x, a.pos.y, a.pos.z + cfg.eye_height};
-            if ((a.pos - self.pos).len() <= 210.0 && world.has_solid_los(e_eye, my_c)) {
+            Vec3 e_muz(a.pos.x, a.pos.y, a.pos.z + cfg.muzzle_height * (1.0 + cfg.size_per_cube * a.cubes));
+            if ((a.pos - self.pos).len() <= 245.0 &&
+                (world.has_solid_los(e_muz, my_c) || world.has_solid_los(e_muz, my_top))) {
                 ++cnt;
             }
         }
@@ -579,7 +638,10 @@ private:
             r.id = id;
             if (it.has("kind")) r.kind = it["kind"].as_str();
             const auto& p = it["pos"].arr_val;
-            if (p.size() >= 3) r.pos = {p[0].as_double(), p[1].as_double(), p[2].as_double()};
+            if (p.size() >= 3) {
+                r.pos = {p[0].as_double(), p[1].as_double(), p[2].as_double()};
+                r.on_roof = (r.pos.z > world.terrain_height(r.pos.x, r.pos.y) + 2.2);
+            }
             if (has_hp) r.hp = it["hp"].as_double(cfg.crate_hp);
             r.last_seen_t = t;
             r.visible_now = true;

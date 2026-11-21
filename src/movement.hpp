@@ -45,7 +45,9 @@ public:
     RoofSpot climb_target;
     double climb_start_t = -999.0;
 
-    // Anti-stuck tracker
+    // Stateful strafe & anti-stuck tracker
+    double strafe_sign = 1.0;
+    double next_strafe_flip_t = 1.3;
     Vec3 stuck_ref_pos;
     double stuck_ref_t = -999.0;
     double stuck_escape_until = -999.0;
@@ -59,6 +61,8 @@ public:
         has_cached_cover = false;
         last_cover_t = -999.0;
         climbing_roof = false;
+        strafe_sign = 1.0;
+        next_strafe_flip_t = 1.3;
         stuck_ref_t = -999.0;
         stuck_escape_until = -999.0;
         stuck_count = 0;
@@ -74,6 +78,12 @@ public:
         MoveDecision out;
         double t = tracker.t;
         Vec2 my_xy = self.pos.xy();
+
+        // Stateful strafe flip (1.15 - 1.50s so we actually accelerate to full 11.7 m/s lateral speed!)
+        if (t >= next_strafe_flip_t) {
+            strafe_sign = -strafe_sign;
+            next_strafe_flip_t = t + 1.15 + 0.12 * ((self.id + static_cast<int>(t)) % 4);
+        }
 
         // Anti-stuck tracking
         if (stuck_ref_t < 0.0) {
@@ -139,6 +149,59 @@ public:
         on_roof = world.get_roof_at(self.pos.x, self.pos.y, cur_roof_z, cur_roof_pid) &&
                   (self.pos.z >= cur_roof_z - 1.5);
 
+        // Pre-scan Supply Drops, Desired Weapon Pickups, and Nearby Cubes
+        const DropInfo* best_drop = nullptr;
+        double best_drop_sc = -1e9;
+        for (const auto& d : tracker.drops) {
+            double dist = (d.pos.xy() - my_xy).len();
+            double eta = dist / std::max(1.0, self.walk_speed);
+            if (d.lands_in > eta + 14.0) continue;
+            if (dist > 230.0 && d.lands_in <= 0.0) continue;
+            if ((d.pos.xy() - tracker.zone.next_center).len() > tracker.zone.next_radius + 10.0) continue;
+            double sc = 200.0 - dist - d.lands_in * 4.0;
+            if (d.holder == self.id) sc += 300.0;
+            if (sc > best_drop_sc) {
+                best_drop_sc = sc;
+                best_drop = &d;
+            }
+        }
+
+        const RememberedItem* best_pickup = nullptr;
+        double best_pick_sc = -1e9;
+        bool need_laser = (self.find_weapon("laser") < 0);
+        bool need_sec = (self.find_weapon(combat.preferred_secondary) < 0);
+        if (need_laser || need_sec) {
+            for (const auto& kv : tracker.pickups) {
+                const RememberedItem& pk = kv.second;
+                if (self.find_weapon(pk.kind) >= 0) continue;
+                if (pk.kind == "mortar") continue;
+                if (pk.kind != "laser" && pk.kind != combat.preferred_secondary && !need_sec) continue;
+                if (std::abs(pk.pos.z - self.pos.z) > 4.5 && !on_roof) continue;
+                double d = (pk.pos.xy() - my_xy).len();
+                if (d > 160.0) continue;
+                if ((pk.pos.xy() - tracker.zone.next_center).len() > tracker.zone.next_radius + 5.0) continue;
+                double sc = (pk.kind == "laser" ? 260.0 : 180.0) - d;
+                if (sc > best_pick_sc) {
+                    best_pick_sc = sc;
+                    best_pickup = &pk;
+                }
+            }
+        }
+
+        const RememberedItem* best_cube = nullptr;
+        double best_cube_d = 1e9;
+        double max_cube_seek = (self.cubes >= 21) ? 14.0 : 95.0;
+        for (const auto& kv : tracker.cubes) {
+            if (std::abs(kv.second.pos.z - self.pos.z) > 4.5 && !on_roof) continue;
+            double d = (kv.second.pos.xy() - my_xy).len();
+            if (d < max_cube_seek && d < best_cube_d) {
+                best_cube_d = d;
+                best_cube = &kv.second;
+            }
+        }
+        bool safe_cube_grab = best_cube &&
+            (best_cube_d < 22.0 || (!tracker.enemy_within(best_cube->pos, 32.0) && best_cube_d < (active_mechs.empty() ? max_cube_seek : 48.0)));
+
         // Select strategic goal
         Vec2 goal = tracker.zone.next_center;
         StrategicMode mode = StrategicMode::CombatEngage;
@@ -152,7 +215,7 @@ public:
             want_boost = (!self.in_zone || req_speed > 0.75 * self.walk_speed) && (self.energy > 15.0);
         } else if (need_regen && !threat_positions.empty()) {
             mode = StrategicMode::RegenCover;
-            if (!has_cached_cover || (t - last_cover_t) > 0.7 || (cached_cover - tracker.zone.next_center).len() > tracker.zone.next_radius - 6.0) {
+            if (!has_cached_cover || (t - last_cover_t) > 0.65 || (cached_cover - tracker.zone.next_center).len() > tracker.zone.next_radius - 6.0) {
                 Vec2 cover_pt;
                 if (world.find_cover_pos(self.pos, threat_positions, tracker.zone.next_center, tracker.zone.next_radius, 52.0, cover_pt)) {
                     cached_cover = cover_pt;
@@ -170,59 +233,6 @@ public:
             }
             want_boost = (los_enemies > 0 && self.energy > 28.0);
         } else {
-            // Check Supply Drops
-            const DropInfo* best_drop = nullptr;
-            double best_drop_sc = -1e9;
-            for (const auto& d : tracker.drops) {
-                double dist = (d.pos.xy() - my_xy).len();
-                double eta = dist / std::max(1.0, self.walk_speed);
-                if (d.lands_in > eta + 14.0) continue; // too early
-                if (dist > 230.0 && d.lands_in <= 0.0) continue; // likely already taken
-                if ((d.pos.xy() - tracker.zone.next_center).len() > tracker.zone.next_radius + 10.0) continue;
-                double sc = 200.0 - dist - d.lands_in * 4.0;
-                if (d.holder == self.id) sc += 300.0;
-                if (sc > best_drop_sc) {
-                    best_drop_sc = sc;
-                    best_drop = &d;
-                }
-            }
-
-            // Check desired weapon pickups
-            const RememberedItem* best_pickup = nullptr;
-            double best_pick_sc = -1e9;
-            bool need_laser = (self.find_weapon("laser") < 0);
-            bool need_sec = (self.find_weapon(combat.preferred_secondary) < 0);
-            if (need_laser || need_sec) {
-                for (const auto& kv : tracker.pickups) {
-                    const RememberedItem& pk = kv.second;
-                    if (self.find_weapon(pk.kind) >= 0) continue;
-                    if (pk.kind == "mortar") continue;
-                    if (pk.kind != "laser" && pk.kind != combat.preferred_secondary && !need_sec) continue;
-                    double d = (pk.pos.xy() - my_xy).len();
-                    if (d > 165.0) continue;
-                    if ((pk.pos.xy() - tracker.zone.next_center).len() > tracker.zone.next_radius + 5.0) continue;
-                    double sc = (pk.kind == "laser" ? 280.0 : 190.0) - d * 1.3;
-                    if (sc > best_pick_sc) {
-                        best_pick_sc = sc;
-                        best_pickup = &pk;
-                    }
-                }
-            }
-
-            // Check nearby cubes (aggressively sweep kill drops!)
-            const RememberedItem* best_cube = nullptr;
-            double best_cube_d = 1e9;
-            for (const auto& kv : tracker.cubes) {
-                double d = (kv.second.pos.xy() - my_xy).len();
-                if (d < 95.0 && d < best_cube_d) {
-                    best_cube_d = d;
-                    best_cube = &kv.second;
-                }
-            }
-
-            bool safe_cube_grab = best_cube &&
-                (best_cube_d < 24.0 || (!tracker.enemy_within(best_cube->pos, 32.0) && best_cube_d < (active_mechs.empty() ? 95.0 : 50.0)));
-
             if (best_drop && (best_drop->holder == self.id || best_drop_sc > 80.0)) {
                 mode = StrategicMode::SupplyDrop;
                 goal = best_drop->pos.xy();
@@ -235,7 +245,7 @@ public:
             } else if (best_pickup && (need_laser || best_pick_sc > 60.0)) {
                 mode = StrategicMode::LootWeapon;
                 goal = best_pickup->pos.xy();
-                if (need_laser && (goal - my_xy).len() > 16.0 && self.energy > 35.0 && los_enemies == 0) {
+                if (need_laser && (goal - my_xy).len() > 16.0 && self.energy > 38.0 && los_enemies == 0) {
                     want_boost = true;
                 }
             } else if (safe_cube_grab) {
@@ -248,9 +258,8 @@ public:
                 bool has_light = (self.find_weapon("lightning") >= 0);
                 bool charging_laser = (has_laser && self.weapons[self.find_weapon("laser")].charge > 0.0);
 
-                // If we don't have a laser yet and face an enemy (or >=2 enemies) in open ground, use cover!
                 if (!has_laser && (los_enemies >= 2 || primary->has_weapon("laser") || self.hp < 0.78 * self.max_hp)) {
-                    if (!has_cached_cover || (t - last_cover_t) > 0.8) {
+                    if (!has_cached_cover || (t - last_cover_t) > 0.75) {
                         Vec2 cover_pt;
                         if (world.find_cover_pos(self.pos, threat_positions, tracker.zone.next_center, tracker.zone.next_radius, 42.0, cover_pt)) {
                             cached_cover = cover_pt;
@@ -286,8 +295,8 @@ public:
                 } else if (combat.want_peek_for_laser) {
                     Vec2 to_t = (primary->pos.xy() - my_xy).normalized();
                     Vec2 side(-to_t.y, to_t.x);
-                    if (std::sin(t * 1.5) < 0.0) side = side * -1.0;
-                    goal = my_xy + to_t * 12.0 + side * 14.0;
+                    side = side * strafe_sign;
+                    goal = clamp_to_zone(my_xy + to_t * 12.0 + side * 14.0, tracker.zone.next_center, std::max(5.0, tracker.zone.next_radius - 10.0));
                 } else {
                     double ideal_dist = 75.0;
                     if (has_light && !has_laser) ideal_dist = 32.0;
@@ -297,21 +306,26 @@ public:
 
                     Vec2 to_t = (primary->pos.xy() - my_xy).normalized();
                     Vec2 tangent(-to_t.y, to_t.x);
-                    // Rapid 0.45s strafe reversal breaks house-bot lead prediction!
-                    if (std::sin(t * 7.0) < 0.0) tangent = tangent * -1.0;
+                    Vec2 test_st = my_xy + tangent * (strafe_sign * 8.0);
+                    if (self.grounded && world.is_wall_blocked(test_st.x, test_st.y, self.pos.z, self.radius + 0.3, self.height, self.step_up)) {
+                        strafe_sign = -strafe_sign;
+                        next_strafe_flip_t = t + 1.15;
+                    }
+                    tangent = tangent * strafe_sign;
                     double rad_err = dist_p - ideal_dist;
                     Vec2 radial = to_t * clamp_val(rad_err * 0.5, -16.0, 16.0);
-                    goal = clamp_to_zone(my_xy + radial + tangent * 18.0, tracker.zone.next_center, std::max(5.0, tracker.zone.next_radius - 12.0));
+                    goal = clamp_to_zone(my_xy + radial + tangent * 20.0, tracker.zone.next_center, std::max(5.0, tracker.zone.next_radius - 12.0));
                 }
 
                 if (los_enemies >= 2 && self.energy > 35.0) want_boost = true;
             } else {
-                // No active enemy right now: farm crates/NPCs early, take a roof inside next_zone, or explore for laser!
-                bool farm_wanted = (self.cubes < 14 || need_laser || need_sec);
+                // No active enemy right now: farm crates/NPCs early, take a roof inside next_zone, or explore!
+                bool farm_wanted = (self.cubes < 21 || need_laser || need_sec);
                 const RememberedItem* farm_crate = nullptr;
                 double farm_crate_d = 1e9;
                 if (farm_wanted) {
                     for (const auto& kv : tracker.crates) {
+                        if (std::abs(kv.second.pos.z - self.pos.z) > 4.5 && !on_roof) continue;
                         double d = (kv.second.pos.xy() - my_xy).len();
                         if (d < 150.0 && (kv.second.pos.xy() - tracker.zone.next_center).len() < tracker.zone.next_radius && d < farm_crate_d) {
                             farm_crate_d = d;
@@ -326,8 +340,7 @@ public:
                 } else if (farm_crate && farm_crate_d < 110.0 && self.hp >= 0.65 * self.max_hp) {
                     mode = StrategicMode::FarmCubes;
                     goal = farm_crate->pos.xy();
-                } else if (!need_laser && !on_roof && self.energy >= 78.0 && self.grounded &&
-                           find_good_roof(self, tracker, world, climb_target)) {
+                } else if (!need_laser && !on_roof && self.energy >= 78.0 && self.grounded && find_good_roof(self, tracker, world, climb_target)) {
                     climbing_roof = true;
                     climb_start_t = t;
                     mode = StrategicMode::RoofControl;
@@ -376,11 +389,13 @@ public:
             goal = my_xy;
         }
 
-        // Compute A* path to goal (throttled to <= 2.5 Hz so decisions stay < 2 ms!)
+        // Compute A* path to goal
         Vec2 steer_target = goal;
-        if (!climbing_roof && !on_roof && (goal - my_xy).len() > 8.0 && !world.is_nav_line_walkable(my_xy, goal)) {
+        bool use_astar = !climbing_roof && !on_roof;
+        if (use_astar && (goal - my_xy).len() > 8.0 &&
+            !world.is_nav_line_walkable(my_xy, goal, self.radius, self.height)) {
             if (cached_path.empty() || ((goal - cached_goal).len() > 24.0 && (t - last_path_t) > 0.45) || (t - last_path_t) > 1.4) {
-                cached_path = world.find_path(my_xy, goal, 4500);
+                cached_path = world.find_path(my_xy, goal, 4500, self.radius, self.height);
                 cached_goal = goal;
                 last_path_t = t;
             }
@@ -393,6 +408,24 @@ public:
         // Supply drop ring standstill (still dodge bullets/mortars!)
         if (standing_capture) {
             steer_target = my_xy;
+        }
+
+        // Timed laser dodge trigger (when enemy laser is about to fire & sees us)
+        bool urgent_laser_dodge = false;
+        for (const auto* m : active_mechs) {
+            if (!m->charging) continue;
+            double ch_elapsed = (m->charge_start_t > 0.0) ? (t - m->charge_start_t) : 0.35;
+            if (ch_elapsed >= 0.48 && (m->pos - self.pos).len() < cfg.laser.range) {
+                Vec3 m_orig(m->pos.x, m->pos.y, m->pos.z + cfg.muzzle_height);
+                if (world.has_solid_los(m_orig, self.center_pos())) {
+                    urgent_laser_dodge = true;
+                    break;
+                }
+            }
+        }
+        if (urgent_laser_dodge && !standing_capture && self.energy > 28.0) {
+            want_boost = true;
+            if (self.grounded && self.energy > 38.0) want_jump = true;
         }
 
         // 24-direction tactical candidate evaluator
@@ -517,6 +550,14 @@ private:
                 break;
             }
         }
+        if (!incoming_threat) {
+            for (const auto& kv : tracker.actors) {
+                if (!kv.second.is_mech && kv.second.in_obs_now && (kv.second.pos - self.pos).len() < 48.0) {
+                    incoming_threat = true;
+                    break;
+                }
+            }
+        }
         if (steer_dist < 1.8 && !incoming_threat && !climbing_roof) {
             return {0.0, 0.0};
         }
@@ -552,7 +593,7 @@ private:
 
             // Wall/slope collision check (skip when climbing in midair above walls)
             if (self.grounded && !climbing_roof) {
-                if (world.is_wall_blocked(cand.x, cand.y, self.pos.z, self.radius + 0.15, self.height)) {
+                if (world.is_wall_blocked(cand.x, cand.y, self.pos.z, self.radius + 0.15, self.height, self.step_up)) {
                     continue;
                 }
                 if (world.terr_nx > 1 && world.terrain_slope_deg(cand.x, cand.y) > self.max_slope_deg - 1.5) {
@@ -591,7 +632,7 @@ private:
                 }
             }
 
-            // 3. Charging laser beam ray perpendicular dodge + break LOS!
+            // 3. Charging laser beam ray perpendicular dodge + timed break LOS!
             for (const auto* m : active_mechs) {
                 if (!m->charging) continue;
                 Vec3 m_orig(m->pos.x, m->pos.y, m->pos.z + cfg.muzzle_height);
@@ -599,10 +640,15 @@ private:
                 Vec3 cand_c(cand.x, cand.y, self.pos.z + 0.5 * self.height);
                 Vec3 rel = cand_c - m_orig;
                 double proj = rel.dot(m_dir);
+                double ch_elapsed = (m->charge_start_t > 0.0) ? (tracker.t - m->charge_start_t) : 0.35;
                 if (proj > 0.0 && proj < cfg.laser.range) {
                     double perp = (rel - m_dir * proj).len();
-                    if (perp < self.radius + 4.5 && world.has_solid_los(m_orig, cand_c)) {
-                        sc -= (self.radius + 4.5 - perp) * 32.0;
+                    bool l_los = world.has_solid_los(m_orig, cand_c);
+                    if (l_los && ch_elapsed >= 0.30) {
+                        sc -= 58.0; // Huge bonus to any direction that breaks laser LOS!
+                    }
+                    if (perp < self.radius + 5.0 && l_los) {
+                        sc -= (self.radius + 5.0 - perp) * (ch_elapsed >= 0.42 ? 42.0 : 28.0);
                     }
                 }
             }
@@ -613,24 +659,42 @@ private:
                 sc -= (dz_cur - (tracker.zone.radius - 3.0)) * 25.0;
             }
 
-            // 5. Multi-enemy LOS exposure & cover awareness
-            if (!active_mechs.empty() && k % 2 == 0) { // sample 12 dirs + center with raycasts to save CPU
+            // 5. Multi-enemy LOS exposure, anti-pincer angular span & cover awareness (all 24 dirs!)
+            if (!active_mechs.empty()) {
                 Vec3 cand_c(cand.x, cand.y, self.pos.z + 0.5 * self.height);
                 int vis_count = 0;
                 bool sees_primary = false;
+                double vis_bearings[16];
                 for (const auto* m : active_mechs) {
-                    if ((m->pos - self.pos).len() > 210.0) continue;
+                    if ((m->pos - self.pos).len() > 240.0) continue;
                     Vec3 m_eye(m->pos.x, m->pos.y, m->pos.z + cfg.eye_height);
                     if (world.has_solid_los(m_eye, cand_c)) {
+                        if (vis_count < 16) {
+                            vis_bearings[vis_count] = std::atan2(m->pos.y - cand.y, m->pos.x - cand.x);
+                        }
                         ++vis_count;
                         if (m->id == combat.primary_target_id) sees_primary = true;
                     }
                 }
+                // Anti-pincer angular span penalty: never stand between enemies (>155 deg apart = rear armor guaranteed!)
+                if (vis_count >= 2) {
+                    double max_sep = 0.0;
+                    int lim = std::min(vis_count, 16);
+                    for (int i = 0; i < lim; ++i) {
+                        for (int j = i + 1; j < lim; ++j) {
+                            double sep = std::abs(angle_diff(vis_bearings[i], vis_bearings[j]));
+                            if (sep > max_sep) max_sep = sep;
+                        }
+                    }
+                    if (max_sep > deg_to_rad(155.0)) {
+                        sc -= 46.0 * (max_sep - deg_to_rad(150.0));
+                    }
+                }
                 if (combat.laser_cooling || self.hp < 0.55 * self.max_hp) {
-                    sc -= vis_count * 18.0;
+                    sc -= vis_count * 22.0;
                 } else {
-                    if (vis_count >= 2) sc -= (vis_count - 1) * 16.0;
-                    if (combat.want_peek_for_laser && sees_primary) sc += 20.0;
+                    if (vis_count >= 2) sc -= (vis_count - 1) * 20.0;
+                    if (combat.want_peek_for_laser && sees_primary) sc += 22.0;
                 }
             }
 
@@ -642,7 +706,7 @@ private:
 
         // If all moving candidates blocked, try nudging toward nearest walkable cell
         if (best_score < -1e17 && world.nav_nx > 0) {
-            int nidx = world.find_nearest_walkable_cell(self.pos.x, self.pos.y);
+            int nidx = world.find_nearest_walkable_cell(self.pos.x, self.pos.y, self.radius, self.height);
             if (nidx >= 0) {
                 Vec2 nw = world.nav_to_world(nidx % world.nav_nx, nidx / world.nav_nx);
                 Vec2 d = nw - my_xy;
