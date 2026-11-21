@@ -158,6 +158,7 @@ public:
             if (d.lands_in > eta + 14.0) continue;
             if (dist > 230.0 && d.lands_in <= 0.0) continue;
             if ((d.pos.xy() - tracker.zone.next_center).len() > tracker.zone.next_radius + 10.0) continue;
+            if (los_enemies >= 2 && (d.holder != self.id || d.progress < 0.65)) continue;
             double sc = 200.0 - dist - d.lands_in * 4.0;
             if (d.holder == self.id) sc += 300.0;
             if (sc > best_drop_sc) {
@@ -237,9 +238,12 @@ public:
                 mode = StrategicMode::SupplyDrop;
                 goal = best_drop->pos.xy();
                 double d_drop = (goal - my_xy).len();
-                if (best_drop->lands_in <= 0.1 && d_drop <= best_drop->radius - 1.6) {
+                bool safe_stand = (los_enemies == 0) ||
+                                  (los_enemies == 1 && self.hp >= 0.60 * self.max_hp && best_drop->progress > 0.30);
+                if (best_drop->lands_in <= 0.1 && d_drop <= best_drop->radius - 1.6 && safe_stand) {
                     standing_capture = true;
-                } else if (best_drop->lands_in < 3.0 && d_drop > best_drop->radius && self.energy > 35.0) {
+                } else if (best_drop->lands_in < 5.0 && d_drop > best_drop->radius &&
+                           self.energy > 35.0 && los_enemies == 0) {
                     want_boost = true;
                 }
             } else if (best_pickup && (need_laser || best_pick_sc > 60.0)) {
@@ -411,6 +415,7 @@ public:
         }
 
         // Timed laser dodge trigger (when enemy laser is about to fire & sees us)
+        // Stay grounded during laser dodge to preserve 58.5 m/s^2 ground acceleration & level aim pitch!
         bool urgent_laser_dodge = false;
         for (const auto* m : active_mechs) {
             if (!m->charging) continue;
@@ -425,7 +430,6 @@ public:
         }
         if (urgent_laser_dodge && !standing_capture && self.energy > 28.0) {
             want_boost = true;
-            if (self.grounded && self.energy > 38.0) want_jump = true;
         }
 
         // 24-direction tactical candidate evaluator
