@@ -56,15 +56,15 @@ public:
             const std::string& id = choices[i]["id"].as_str();
             double sc = 10.0;
             if (!is_confirmed_ffa) {
-                // Practice 1v15 curve (U3: 4.08 Practice_48)
+                // Practice 1v15 curve (Step 11 Test 5: armor & servos above gun upgrades!)
                 if (id == "laser_damage") sc = has_laser ? 120.0 : 40.0;
                 else if (id == "laser_charge") sc = has_laser ? 118.0 : 40.0;
-                else if (id == "nanites") sc = 115.0;
-                else if (id == "plating") sc = 108.0 + (self.hp < 0.7 * self.max_hp ? 10.0 : 0.0);
-                else if (id == "gun_damage") sc = has_gun ? 102.0 : 15.0;
-                else if (id == "gun_rate") sc = has_gun ? 100.0 : 15.0;
-                else if (id == "armor") sc = 96.0;
-                else if (id == "servos") sc = 94.0;
+                else if (id == "nanites") sc = 116.0;
+                else if (id == "plating") sc = 112.0 + (self.hp < 0.7 * self.max_hp ? 10.0 : 0.0);
+                else if (id == "armor") sc = 108.0;
+                else if (id == "servos") sc = 104.0;
+                else if (id == "gun_damage") sc = has_gun ? 96.0 : 15.0;
+                else if (id == "gun_rate") sc = has_gun ? 94.0 : 15.0;
                 else if (id == "gun_mag") sc = has_gun ? 86.0 : 15.0;
                 else if (id == "gun_velocity") sc = has_gun ? 84.0 : 15.0;
                 else if (id == "laser_pierce") sc = has_laser ? 82.0 : 20.0;
@@ -170,10 +170,11 @@ public:
                                (los_enemies > 0) ||
                                tracker.enemy_within(self.pos, 95.0);
         // Also avoid resetting regen timer with low-value chip shots when fleeing behind cover at low HP
-        bool in_low_hp_regen = (self.hp < 0.46 * self.max_hp) &&
-                               (los_enemies == 0) &&
+        bool use_hyst_stealth = (tracker.ffa_confidence < 0.55);
+        bool in_low_hp_regen = (los_enemies == 0) &&
                                !tracker.enemy_within(self.pos, 42.0) &&
-                               ((tracker.t - tracker.last_combat_t) >= 0.8);
+                               (((self.hp < 0.46 * self.max_hp) && ((tracker.t - tracker.last_combat_t) >= 0.8)) ||
+                                (use_hyst_stealth && (self.hp < 0.78 * self.max_hp) && ((tracker.t - tracker.last_combat_t) >= 2.2)));
 
         // Select best shootable / trackable enemy mech
         int best_mech_id = -1;
@@ -520,7 +521,8 @@ private:
                 bool next_laser_clear = pred_hits_cyl && (!pred_wall_hit || pred_cyl_t < pred_wall_t);
 
                 Vec3 future_tgt_aim(pred_tgt.x + target_vel.x * 0.12, pred_tgt.y + target_vel.y * 0.12, pred_tgt.z + aim_z_frac * target_h);
-                bool about_to_lose_los = is_mech && lw.charge >= 0.48 && !world.has_solid_los(pred_orig, future_tgt_aim);
+                Vec3 future_self_orig(pred_orig.x + self.vel.x * 0.12, pred_orig.y + self.vel.y * 0.12, pred_orig.z);
+                bool about_to_lose_los = is_mech && lw.charge >= 0.45 && !world.has_solid_los(future_self_orig, future_tgt_aim);
 
                 bool kill_now = (lw.charge >= min_charge_s && target_hp <= cur_dmg * 0.80);
                 bool full_now = (lw.charge >= full_charge_s - 0.015);

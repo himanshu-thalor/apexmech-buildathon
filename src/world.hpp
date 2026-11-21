@@ -1401,8 +1401,16 @@ private:
                 bool blocked = false;
                 if (wx < min_x + 3.2 || wx > max_x - 3.2 || wy < min_y + 3.2 || wy > max_y - 3.2) {
                     blocked = true;
-                } else if (terr_nx > 1 && terrain_slope_deg(wx, wy) > max_slope_deg - 2.0) {
-                    blocked = true;
+                } else if (terr_nx > 1) {
+                    for (double oy : {-1.5, 0.0, 1.5}) {
+                        for (double ox : {-1.5, 0.0, 1.5}) {
+                            if (terrain_slope_deg(wx + ox, wy + oy) > max_slope_deg - 3.0) {
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if (blocked) break;
+                    }
                 }
 
                 // Check prism overlap at ground level & check roof eligibility

@@ -49,6 +49,7 @@ public:
     // Mode memory, persistent explorer & unreachable roof blacklist
     StrategicMode last_mode = StrategicMode::CombatEngage;
     std::unordered_map<int, double> blacklisted_roofs;
+    bool in_regen_hyst = false;
 
     Vec2 explore_goal = {0.0, 0.0};
     bool has_explore_goal = false;
@@ -81,6 +82,7 @@ public:
         climbing_roof = false;
         last_mode = StrategicMode::CombatEngage;
         blacklisted_roofs.clear();
+        in_regen_hyst = false;
         has_explore_goal = false;
         explore_set_t = -999.0;
         explore_idx = 0;
@@ -170,8 +172,20 @@ public:
         double regen_enter_hp = (tracker.ffa_confidence > 0.5 || active_mechs.size() >= 2)
                                     ? 0.65 * self.max_hp
                                     : 0.52 * self.max_hp;
-        bool need_regen = (self.hp < regen_enter_hp) &&
-                          (!active_mechs.empty() || (t - tracker.last_combat_t) < self.regen_delay + 2.5);
+        bool base_need_regen = (self.hp < regen_enter_hp) &&
+                               (!active_mechs.empty() || (t - tracker.last_combat_t) < self.regen_delay + 2.5);
+        if (tracker.ffa_confidence < 0.55) {
+            if (base_need_regen && los_enemies == 0 && (t - tracker.last_combat_t) >= 2.2) {
+                in_regen_hyst = true;
+            }
+            if (self.hp >= 0.84 * self.max_hp || los_enemies > 0 || active_mechs.empty() ||
+                (t - tracker.last_combat_t) < 1.5) {
+                in_regen_hyst = false;
+            }
+        } else {
+            in_regen_hyst = false;
+        }
+        bool need_regen = base_need_regen || in_regen_hyst;
 
         bool on_roof = false;
         double cur_roof_z = 0.0;
@@ -470,7 +484,8 @@ public:
         if (use_astar && (goal - my_xy).len() > 8.0 &&
             !world.is_nav_line_walkable(my_xy, goal, self.radius, self.height)) {
             if (cached_path.empty() || ((goal - cached_goal).len() > 24.0 && (t - last_path_t) > 0.45) || (t - last_path_t) > 1.4) {
-                cached_path = world.find_path(my_xy, goal, 4500, self.radius, self.height);
+                int max_exp = (mode == StrategicMode::ZoneRotate) ? 9000 : 4500;
+                cached_path = world.find_path(my_xy, goal, max_exp, self.radius, self.height);
                 cached_goal = goal;
                 last_path_t = t;
             }
@@ -771,6 +786,14 @@ private:
                     if (max_sep > deg_to_rad(155.0)) {
                         sc -= 46.0 * (max_sep - deg_to_rad(150.0));
                     }
+                    // True 92-degree rear-arc exposure penalty relative to our current turret/aim yaw!
+                    int rear_vis = 0;
+                    for (int i = 0; i < lim; ++i) {
+                        if (std::abs(angle_diff(vis_bearings[i], combat.aim_yaw)) > deg_to_rad(92.0)) {
+                            ++rear_vis;
+                        }
+                    }
+                    sc -= rear_vis * 24.0;
                 }
                 if (combat.laser_cooling || self.hp < 0.55 * self.max_hp) {
                     sc -= vis_count * 22.0;
